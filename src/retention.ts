@@ -14,6 +14,7 @@ import type { HindsightClientWrapper } from "./client";
 import type { HindsightConfig } from "./config";
 import { expandSessionObservationScopes } from "./config";
 import { prefixLog } from "./constants";
+import { debugLog, debugWarn } from "./debug-log";
 import {
   buildDocumentTags,
   buildMessageArrayFromParsedSession,
@@ -672,7 +673,7 @@ export async function parseAndUpsertSession(
 
     if (debug) {
       const elapsed = performance.now() - t0;
-      console.log(
+      debugLog(
         prefixLog(
           `debug: parsePipeline(${sessionId}) took ${elapsed.toFixed(2)}ms, ${messages.length} messages`
         )
@@ -824,6 +825,6 @@ function updateLiveStateFromParsed(
 
   const success = writeSessionState(sessionId, newState);
   if (!success) {
-    console.warn(`Failed to update live session state for ${sessionId} after flush`);
+    debugWarn(`Failed to update live session state for ${sessionId} after flush`);
   }
 }

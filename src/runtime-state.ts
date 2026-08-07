@@ -4,7 +4,7 @@
  *
  * Holds two independent latches plus a unified getter:
  *
- * - `startupReady`: process-global health/version latch reflecting the most
+ * - `startupReady`: health/version latch reflecting the most
  *   recent probe. Starts `false`, set `true` after a healthy probe and `false`
  *   again when a later `session_start` probe observes an unreachable/
  *   incompatible server — so the extension re-enters the unified degraded mode
@@ -50,15 +50,17 @@
  * reason has been classified (e.g. before the first `session_start`); there
  * is no generic catch-all fallback.
  *
- * Hindsight tools are process-global and registered lazily by the first healthy
+ * Hindsight tools are registered lazily by the first healthy
  * `session_start` (not by `before_agent_start` and not at extension init), so
  * session-specific setup remains owned by the session lifecycle. `before_agent_start`
  * only READS `isOperationalReady()` and returns if degraded — it never probes or
  * mutates readiness (session_start is awaited before the first prompt). The
  * recall filter and renderer are always active regardless of readiness.
  *
- * index.ts's `_resetState()` is the single reset entrypoint and calls all the
- * resets here; tests already invoke `_resetState()`.
+ * index.ts's `_resetState()` is the single reset entrypoint and calls
+ * `resetRuntimeState()` here; tests already invoke `_resetState()`.
+ * `resetRuntimeState()` is also invoked at the top of each `default(pi)` so a
+ * replacement extension instance starts from a clean slate.
  */
 
 let startupReady = false;
@@ -121,7 +123,7 @@ export function resetActiveSessionProjectReady(): void {
 
 /**
  * Unified operational-ready getter for the normal (enabled, valid-config)
- * path. The extension is operational only when BOTH the process-global
+ * path. The extension is operational only when BOTH the
  * health/version probe has succeeded AND the active session's project-local
  * project config is usable. Any single failed cause (unreachable/incompatible
  * server, or required-but-missing/invalid cwd-local project config) puts the
@@ -141,7 +143,7 @@ export function isOperationalReady(): boolean {
 }
 
 /**
- * The set of Hindsight tools that have been registered (process-global, via
+ * The set of Hindsight tools that have been registered (via
  * `registerTools`). Used by `refreshToolVisibility` to know which tools to
  * re-show after leaving degraded mode, and to hide all of them when entering
  * it. Set by `tools.ts`'s `registerTools`; reset by `index.ts`'s `_resetState()`.
@@ -161,6 +163,22 @@ export function setRegisteredHindsightTools(names: string[]): void {
 /** Reset the registered-tools record. Exported for testing/reset only. */
 export function resetRegisteredHindsightTools(): void {
   registeredHindsightTools = [];
+}
+
+/**
+ * Reset every runtime-state slot to its initial value. Called at the top of
+ * each extension-factory invocation (`default(pi)`) so a freshly constructed
+ * extension instance never claims a registration/readiness/degraded reason
+ * recorded by an older runtime. Pi may reuse the cached module factory for
+ * same-cwd session replacements; reload instead reloads extension modules and
+ * rebuilds the ExtensionRunner. Both paths invoke the factory again. Also
+ * called by `index.ts`'s `_resetState()` for tests.
+ */
+export function resetRuntimeState(): void {
+  resetStartupReady();
+  resetActiveSessionProjectReady();
+  resetRegisteredHindsightTools();
+  resetDegradedReason();
 }
 
 export const DEGRADED_REASON_PENDING = "startup readiness has not completed yet";

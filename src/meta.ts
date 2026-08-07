@@ -19,6 +19,7 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { HindsightConfig } from "./config";
+import { debugWarn } from "./debug-log";
 import { ensureParsedSessionDir, getMetaPath } from "./parsed-store";
 import { touchPendingFlag } from "./queue";
 import {
@@ -298,9 +299,9 @@ export async function updateSessionMetadata(
       if (!success) {
         // If state update fails, try to delete stale state so next flush
         // falls back to parsing the session file
-        console.warn(`Failed to update live session state for ${sessionId}, removing stale state`);
+        debugWarn(`Failed to update live session state for ${sessionId}, removing stale state`);
         if (!removeSessionState(sessionId)) {
-          console.warn(`Failed to remove stale session state for ${sessionId}`);
+          debugWarn(`Failed to remove stale session state for ${sessionId}`);
         }
       }
     }
@@ -310,7 +311,7 @@ export async function updateSessionMetadata(
     if (updates.tags !== undefined || updates.extraContext !== undefined) {
       const result = touchPendingFlag(sessionId);
       if (!result.success) {
-        console.warn(`Failed to queue session for re-flush: ${result.error}`);
+        debugWarn(`Failed to queue session for re-flush: ${result.error}`);
       }
     }
   }
