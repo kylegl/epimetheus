@@ -22,6 +22,7 @@ import {
 import { prefixLog, STATUS_ID } from "./constants";
 import { getDataDir } from "./data-dir";
 import { getLegacyDataDir, migrateDataDir } from "./data-dir-migration";
+import { debugError, debugLog, debugWarn } from "./debug-log";
 import { getHindsightMeta, shouldSessionBeRetained, updateSessionMetadata } from "./meta";
 import { shouldRetainMessage } from "./prepare";
 import { evaluateActiveSessionProjectState, resolveProjectName } from "./project-config";
@@ -33,10 +34,8 @@ import {
   getDegradedReason,
   isOperationalReady,
   markStartupReady,
-  resetActiveSessionProjectReady,
-  resetDegradedReason,
   resetRegisteredHindsightTools,
-  resetStartupReady,
+  resetRuntimeState,
   setActiveSessionProjectReady,
   setDegradedReason,
 } from "./runtime-state";
@@ -58,30 +57,21 @@ let lastRecallDetails: RecallMessageDetails | null = null;
 // Track the last compatibility warning so we don't spam session_start events.
 let lastCompatibilityMessage: string | null = null;
 
-// Hindsight tools are process-global and registered lazily from session_start.
-// This is separate from startupReady: readiness gates operational handlers,
-// while toolsRegistered only makes registerTools() idempotent.
-let toolsRegistered = false;
-
-// In-flight health/version probe shared by overlapping readiness checks.
-// Cleared after each attempt so failures can be retried; successful readiness
-// is recorded in runtime-state's startupReady latch.
-let startupReadyPromise: Promise<boolean> | null = null;
-
 /**
  * Reset module-level mutable state. Exported for testing only.
+ *
+ * `toolsRegistered` and `startupReadyPromise` are no longer module-level — they
+ * are scoped to each extension-factory invocation (see `default`) so a
+ * replacement runtime cannot inherit them. Those reset naturally when the
+ * factory invocation ends; the shared runtime-state recorded here is reset via
+ * {@link resetRuntimeState}.
  */
 export function _resetState(): void {
   autoRecallDisplayOverride = null;
   lastRecallMessage = null;
   lastRecallDetails = null;
   lastCompatibilityMessage = null;
-  toolsRegistered = false;
-  startupReadyPromise = null;
-  resetStartupReady();
-  resetActiveSessionProjectReady();
-  resetRegisteredHindsightTools();
-  resetDegradedReason();
+  resetRuntimeState();
   clearProjectNameCache();
 }
 
@@ -134,6 +124,25 @@ function registerRecallRenderer(pi: ExtensionAPI, getDisplay: () => boolean): vo
 }
 
 export default function (pi: ExtensionAPI) {
+  // Pi creates fresh extension registrations for each session replacement and
+  // reload. `/new`, `/resume`, and `/fork` tear down the old session runtime and
+  // may reuse the cached module factory when the cwd is unchanged; `/reload`
+  // reloads extension modules and rebuilds the ExtensionRunner while retaining
+  // the AgentSession. This factory can therefore run multiple times in one
+  // process. To prevent a replacement instance from inheriting an older
+  // runtime's state, all mutable registration/probe state is scoped to THIS
+  // factory instance:
+  //   - toolsRegistered and startupReadyPromise live here as locals, so a fresh
+  //     instance never skips registerTools() (because an older instance
+  //     registered) and never shares an in-flight probe (whose ctx would belong
+  //     to a torn-down runtime).
+  //   - the module-level runtime-state (registered tool names, readiness
+  //     latches, degraded reason) is reset on entry so this instance never
+  //     claims a registration/readiness recorded by an older runtime.
+  resetRuntimeState();
+  let toolsRegistered = false;
+  let startupReadyPromise: Promise<boolean> | null = null;
+
   // One-time data-dir migration (legacy <agentdir>/extensions/pi-hindsight →
   // <agentdir>/epimetheus). Runs before config load / new-dir creation so the
   // config and data the rest of the extension reads already lives in the new
@@ -141,14 +150,14 @@ export default function (pi: ExtensionAPI) {
   // file makes it a silent no-op once done).
   const migration = migrateDataDir();
   if (migration.action === "copied") {
-    console.log(
+    debugLog(
       prefixLog(
         `migrated data directory to ${getDataDir()} (copied from ${getLegacyDataDir()}). ` +
           `The legacy directory was left in place; remove it after verifying the migration.`
       )
     );
   } else if (migration.action === "warned" && migration.message) {
-    console.warn(migration.message);
+    debugWarn(migration.message);
   }
 
   // Load and validate config
@@ -165,7 +174,7 @@ export default function (pi: ExtensionAPI) {
   //    - autoRecallDisplay: false → renderer hides messages from the chat
   //      (returns empty lines), preventing raw custom message data from showing
   if (!config.enabled) {
-    console.log(prefixLog("disabled via config"));
+    debugLog(prefixLog("disabled via config"));
 
     // Filter hindsight-recall messages from context
     registerRecallFilter(pi);
@@ -181,11 +190,11 @@ export default function (pi: ExtensionAPI) {
   let client: HindsightClientWrapper | null = null;
 
   if (warning) {
-    console.warn(warning);
+    debugWarn(warning);
   }
   if (validation.warnings && validation.warnings.length > 0) {
     for (const w of validation.warnings) {
-      console.warn(w);
+      debugWarn(w);
     }
   }
 
@@ -199,7 +208,7 @@ export default function (pi: ExtensionAPI) {
   // reaching the hasUsableConfig check.
   if (!validation.valid) {
     for (const error of validation.errors) {
-      console.error(error);
+      debugError(error);
     }
     // Classify the degraded reason for manual operational-command blocks so
     // the user is told exactly which config fields are invalid (never the old
@@ -333,143 +342,169 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (event, ctx) => {
-    // session_start owns per-session setup. Health/version readiness is probed
-    // every time (re-enterable): a failed probe re-enters the unified degraded
-    // mode (startupReady=false → isOperationalReady=false → all tools hidden,
-    // auto-recall/retain/flush skipped, operational commands blocked); a healthy
-    // probe restores readiness. setup then runs on every session_start so
-    // new/resumed sessions get their own metadata and tool visibility.
-    const probeHealthy = await ensureStartupReady(ctx);
-    if (!probeHealthy) {
-      // Server unreachable/incompatible → unified degraded mode. Status was
-      // already set unhealthy by probeStartupHealth. If tools were already
-      // registered (e.g. from a prior healthy session_start), hide ALL of them
-      // now that we've re-entered degraded mode (isOperationalReady() is false).
-      // On a first-ever failed start, no tools are registered yet — tools
-      // register lazily only on a healthy session_start, so there is nothing to
-      // hide and no setActiveTools call. activeSessionProjectReady is left as-is;
-      // the server failure is the degraded cause for this session.
-      if (toolsRegistered) {
-        refreshToolVisibility(pi, false);
+    // Pi catches and reports extension event errors, but the phase is otherwise
+    // lost. Track it here so debug logs identify failures that can leave the
+    // extension operational while preventing its lazy tool registration.
+    let phase = "probing Hindsight server readiness";
+    try {
+      // session_start owns per-session setup. Health/version readiness is probed
+      // every time (re-enterable): a failed probe re-enters the unified degraded
+      // mode (startupReady=false → isOperationalReady=false → all tools hidden,
+      // auto-recall/retain/flush skipped, operational commands blocked); a healthy
+      // probe restores readiness. setup then runs on every session_start so
+      // new/resumed sessions get their own metadata and tool visibility.
+      const probeHealthy = await ensureStartupReady(ctx);
+      if (!probeHealthy) {
+        // Server unreachable/incompatible → unified degraded mode. Status was
+        // already set unhealthy by probeStartupHealth. If tools were already
+        // registered (e.g. from a prior healthy session_start), hide ALL of them
+        // now that we've re-entered degraded mode (isOperationalReady() is false).
+        // On a first-ever failed start, no tools are registered yet — tools
+        // register lazily only on a healthy session_start, so there is nothing to
+        // hide and no setActiveTools call. activeSessionProjectReady is left as-is;
+        // the server failure is the degraded cause for this session.
+        if (toolsRegistered) {
+          refreshToolVisibility(pi, false);
+        }
+        return;
       }
-      return;
-    }
 
-    // Validate the active session's project-local config state BEFORE
-    // enabling operational behavior (retain tool visibility, auto-mark metadata,
-    // startup flush). An invalid/required-but-missing cwd-local project config
-    // hard-fails the ACTIVE session through this degraded pathway: unhealthy
-    // status, retain tool hidden, auto-retain skipped (see message_end), and no
-    // startup flush. Diagnostic commands (/hindsight status, /hindsight
-    // config) and the recovery command (/hindsight detach-project-name, which
-    // is NOT in OPERATIONAL_SUBCOMMANDS) remain available. The flush path
-    // (parseAndUpsertSession) re-validates freshly so flush-pending still
-    // handles other sessions and catches files that disappeared later.
-    const entries = ctx.sessionManager.getEntries();
-    const existingMeta = getHindsightMeta(entries);
-    const sessionHeader = ctx.sessionManager.getHeader();
-    const sessionCwd = sessionHeader?.cwd ?? ctx.cwd;
-    const projectState = evaluateActiveSessionProjectState(sessionCwd, existingMeta);
+      // Validate the active session's project-local config state BEFORE
+      // enabling operational behavior (retain tool visibility, auto-mark metadata,
+      // startup flush). An invalid/required-but-missing cwd-local project config
+      // hard-fails the ACTIVE session through this degraded pathway: unhealthy
+      // status, retain tool hidden, auto-retain skipped (see message_end), and no
+      // startup flush. Diagnostic commands (/hindsight status, /hindsight
+      // config) and the recovery command (/hindsight detach-project-name, which
+      // is NOT in OPERATIONAL_SUBCOMMANDS) remain available. The flush path
+      // (parseAndUpsertSession) re-validates freshly so flush-pending still
+      // handles other sessions and catches files that disappeared later.
+      phase = "evaluating the active session's project configuration";
+      const entries = ctx.sessionManager.getEntries();
+      const existingMeta = getHindsightMeta(entries);
+      const sessionHeader = ctx.sessionManager.getHeader();
+      const sessionCwd = sessionHeader?.cwd ?? ctx.cwd;
+      const projectState = evaluateActiveSessionProjectState(sessionCwd, existingMeta);
 
-    if (!projectState.ready) {
-      // Active session is in failed project-local config state → single
-      // degraded mode: unhealthy status, ALL Hindsight tools hidden (not just
-      // retain), no auto-retain (message_end), no startup flush. Diagnostic
-      // commands (/hindsight status, /hindsight config, /hindsight toggle-display,
-      // /hindsight popup) and the recovery command (/hindsight detach-project-name,
-      // which is NOT in OPERATIONAL_SUBCOMMANDS) remain available. The flush path
-      // (parseAndUpsertSession) re-validates freshly per target session so
-      // flush-pending still handles other sessions and catches files that
-      // disappeared later.
-      setActiveSessionProjectReady(false);
-      setDegradedReason({
-        kind: DegradedReasonKind.ProjectName,
-        message: `active session's project name is unavailable: ${projectState.reason}`,
-        projectNameRecovery: projectState.recovery,
-        cwd: sessionCwd,
-        configPath: projectState.configPath,
-      });
-      ctx.ui.setStatus(STATUS_ID, config.statusUnhealthy);
-      const configPathStr =
-        projectState.configPath ?? `${sessionCwd ?? "<cwd>"}/.pi/epimetheus/config.jsonc`;
-      const projectRecoveryAdvice =
-        projectState.recovery === "fix-config"
-          ? `Fix ${configPathStr} (see \`/hindsight config\` for details).`
-          : `Run \`/hindsight detach-project-name\` to stop requiring it, or fix ${configPathStr}.`;
-      ctx.ui.notify(
-        prefixLog(
-          `Project config unavailable: ${projectState.reason}. ` +
-            `Tools hidden and retention disabled for this session. ` +
-            projectRecoveryAdvice
-        ),
-        "warning"
-      );
-      // Register hindsight tools once (process-global) so they can be
-      // re-shown when the session recovers; then hide ALL of them via the
-      // unified visibility refresh (isOperationalReady() is false here, so
-      // refreshToolVisibility hides every registered hindsight_* tool).
+      if (!projectState.ready) {
+        // Active session is in failed project-local config state → single
+        // degraded mode: unhealthy status, ALL Hindsight tools hidden (not just
+        // retain), no auto-retain (message_end), no startup flush. Diagnostic
+        // commands (/hindsight status, /hindsight config, /hindsight toggle-display,
+        // /hindsight popup) and the recovery command (/hindsight detach-project-name,
+        // which is NOT in OPERATIONAL_SUBCOMMANDS) remain available. The flush path
+        // (parseAndUpsertSession) re-validates freshly per target session so
+        // flush-pending still handles other sessions and catches files that
+        // disappeared later.
+        setActiveSessionProjectReady(false);
+        setDegradedReason({
+          kind: DegradedReasonKind.ProjectName,
+          message: `active session's project name is unavailable: ${projectState.reason}`,
+          projectNameRecovery: projectState.recovery,
+          cwd: sessionCwd,
+          configPath: projectState.configPath,
+        });
+        ctx.ui.setStatus(STATUS_ID, config.statusUnhealthy);
+        const configPathStr =
+          projectState.configPath ?? `${sessionCwd ?? "<cwd>"}/.pi/epimetheus/config.jsonc`;
+        const projectRecoveryAdvice =
+          projectState.recovery === "fix-config"
+            ? `Fix ${configPathStr} (see \`/hindsight config\` for details).`
+            : `Run \`/hindsight detach-project-name\` to stop requiring it, or fix ${configPathStr}.`;
+        ctx.ui.notify(
+          prefixLog(
+            `Project config unavailable: ${projectState.reason}. ` +
+              `Tools hidden and retention disabled for this session. ` +
+              projectRecoveryAdvice
+          ),
+          "warning"
+        );
+        // Register hindsight tools once (per extension instance) so they can be
+        // re-shown when the session recovers; then hide ALL of them via the
+        // unified visibility refresh (isOperationalReady() is false here, so
+        // refreshToolVisibility hides every owned hindsight_* tool).
+        phase = "registering Hindsight tools";
+        if (!toolsRegistered) {
+          registerTools(pi, config, client);
+          toolsRegistered = true;
+        }
+        phase = "refreshing Hindsight tool visibility";
+        refreshToolVisibility(pi, false);
+        return;
+      }
+
+      // Active session project name OK. Mirror this in the per-session latch so
+      // message_end auto-retain and the retain tool visibility reflect the now-
+      // healthy session (a prior failed session may have left it false).
+      setActiveSessionProjectReady(true);
+      // The session is operational (server probe succeeded + project name OK):
+      // clear any prior degraded reason.
+      setDegradedReason(null);
+
+      // Auto-create session metadata if none exists, using retainSessionsByDefault
+      // as the default retained state. This ensures every session has explicit
+      // metadata, so toggle-retain and other commands work predictably.
+      //
+      // If a valid cwd-local project config exists for an unmarked session,
+      // auto-mark usesProjectConfig:true so future flushes require it
+      // (latest value wins, so an explicit false from /hindsight
+      // detach-project-name survives — auto-mark only fires when the flag is
+      // still undefined).
+      phase = "writing session metadata";
+      if (!existingMeta) {
+        const sessionId = ctx.sessionManager.getSessionId();
+        const updates: Partial<{ retained: boolean; usesProjectConfig: boolean }> = {
+          retained: config.retainSessionsByDefault,
+        };
+        if (projectState.autoMark) updates.usesProjectConfig = true;
+        await updateSessionMetadata(pi, sessionId, entries, updates, config);
+      } else if (existingMeta.usesProjectConfig === undefined && projectState.autoMark) {
+        // Existing session without an explicit usesProjectConfig flag. Auto-mark
+        // true without touching pending (the flag affects future flushes and
+        // auto-recall; the user can re-flush manually if they want retroactive tag correction).
+        // Explicit user detach (usesProjectConfig:false) is preserved because
+        // latest-wins only re-marks when the flag is still undefined.
+        const sessionId = ctx.sessionManager.getSessionId();
+        await updateSessionMetadata(pi, sessionId, entries, { usesProjectConfig: true }, config);
+      }
+
+      // Register hindsight tools once (per extension instance). Late
+      // registration auto-activates the tools via refreshTools, so they are
+      // visible from the first agent turn on. Idempotent — only the first
+      // session_start reaching here with toolsRegistered false registers;
+      // later session_starts skip this for tools but still run the per-session
+      // metadata/visibility work.
+      phase = "registering Hindsight tools";
       if (!toolsRegistered) {
         registerTools(pi, config, client);
         toolsRegistered = true;
       }
-      refreshToolVisibility(pi, false);
-      return;
-    }
+      // Refresh tool visibility for the unified operational state + this
+      // session's retention flag. Operational here (startupReady latched and the
+      // active-session project config just validated OK), so all registered tools
+      // are shown except hindsight_retain when the session is not retained.
+      phase = "refreshing Hindsight tool visibility";
+      refreshToolVisibility(pi, shouldSessionBeRetained(entries, config));
 
-    // Active session project name OK. Mirror this in the per-session latch so
-    // message_end auto-retain and the retain tool visibility reflect the now-
-    // healthy session (a prior failed session may have left it false).
-    setActiveSessionProjectReady(true);
-    // The session is operational (server probe succeeded + project name OK):
-    // clear any prior degraded reason.
-    setDegradedReason(null);
-
-    // Auto-create session metadata if none exists, using retainSessionsByDefault
-    // as the default retained state. This ensures every session has explicit
-    // metadata, so toggle-retain and other commands work predictably.
-    //
-    // If a valid cwd-local project config exists for an unmarked session,
-    // auto-mark usesProjectConfig:true so future flushes require it
-    // (latest value wins, so an explicit false from /hindsight
-    // detach-project-name survives — auto-mark only fires when the flag is
-    // still undefined).
-    if (!existingMeta) {
-      const sessionId = ctx.sessionManager.getSessionId();
-      const updates: Partial<{ retained: boolean; usesProjectConfig: boolean }> = {
-        retained: config.retainSessionsByDefault,
-      };
-      if (projectState.autoMark) updates.usesProjectConfig = true;
-      await updateSessionMetadata(pi, sessionId, entries, updates, config);
-    } else if (existingMeta.usesProjectConfig === undefined && projectState.autoMark) {
-      // Existing session without an explicit usesProjectConfig flag. Auto-mark
-      // true without touching pending (the flag affects future flushes and
-      // auto-recall; the user can re-flush manually if they want retroactive tag correction).
-      // Explicit user detach (usesProjectConfig:false) is preserved because
-      // latest-wins only re-marks when the flag is still undefined.
-      const sessionId = ctx.sessionManager.getSessionId();
-      await updateSessionMetadata(pi, sessionId, entries, { usesProjectConfig: true }, config);
-    }
-
-    // Register hindsight tools once (process-global). Late registration
-    // auto-activates the tools via refreshTools, so they are visible from the
-    // first agent turn on. Idempotent — only the first session_start reaching
-    // here with toolsRegistered false registers; later session_starts skip this
-    // for tools but still run the per-session metadata/visibility work.
-    if (!toolsRegistered) {
-      registerTools(pi, config, client);
-      toolsRegistered = true;
-    }
-    // Refresh tool visibility for the unified operational state + this
-    // session's retention flag. Operational here (startupReady latched and the
-    // active-session project config just validated OK), so all registered tools
-    // are shown except hindsight_retain when the session is not retained.
-    refreshToolVisibility(pi, shouldSessionBeRetained(entries, config));
-
-    // On startup, optionally flush pending work across all sessions. This is
-    // reason-gated to `session_start` only — it is a best-effort cleanup of old
-    // pending sessions, not a readiness prerequisite.
-    if (event.reason === "startup" && config.autoFlushPendingOn.includes("startup") && client) {
-      await flushAllPending(config, client, ctx, { notifyNoWork: false, autoFlush: true });
+      // On startup, optionally flush pending work across all sessions. This is
+      // reason-gated to `session_start` only — it is a best-effort cleanup of old
+      // pending sessions, not a readiness prerequisite.
+      if (event.reason === "startup" && config.autoFlushPendingOn.includes("startup") && client) {
+        phase = "flushing pending sessions";
+        await flushAllPending(config, client, ctx, { notifyNoWork: false, autoFlush: true });
+      }
+    } catch (error) {
+      if (config.debug) {
+        const details =
+          error instanceof Error
+            ? `${error.message}${error.stack ? `\n${error.stack}` : ""}`
+            : String(error);
+        debugError(
+          prefixLog(`session_start failed during ${phase}:
+${details}`)
+        );
+      }
+      throw error;
     }
   });
 
@@ -698,9 +733,9 @@ export default function (pi: ExtensionAPI) {
           return (message: string, level?: "info" | "warning" | "error") => {
             notify(message, level);
             if (level === "warning") {
-              console.warn(prefixLog(message));
+              debugWarn(prefixLog(message));
             } else if (level === "error") {
-              console.error(prefixLog(message));
+              debugError(prefixLog(message));
             }
           };
         }
@@ -828,6 +863,19 @@ export default function (pi: ExtensionAPI) {
   //     skipped to avoid duplicate work (see config validation warning).
   pi.on("session_shutdown", async (event, ctx: ExtensionContext) => {
     if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") return;
+    // `/reload` rebuilds the ExtensionRunner and its tool registry from scratch
+    // (agent-session reload() → _buildRuntime). In real Pi the fresh runner
+    // re-runs this factory (`default(pi)`) with fresh local state and a
+    // runtime-state reset, so no explicit latch clearing is needed here. The
+    // defensive reset below is kept for the same-instance (reused `pi`) reload
+    // case and for consistency with the factory-entry reset: it clears the
+    // idempotency latch locally and the runtime-state registered record so the
+    // next session_start re-registers against the (possibly rebuilt) registry
+    // rather than leaving the fresh registry without any hindsight_* tools.
+    if (event.reason === "reload") {
+      toolsRegistered = false;
+      resetRegisteredHindsightTools();
+    }
     if (!client || !isOperationalReady()) return;
     if (event.reason === "reload") {
       if (!config.autoFlushSessionOn.includes("reload")) return;
@@ -1161,7 +1209,7 @@ export async function doAutoRecallImpl(
     );
 
     if (!result.success) {
-      console.warn("Auto-recall failed:", result.error);
+      debugWarn("Auto-recall failed:", result.error);
       cacheDetails(null);
       return null;
     }
@@ -1184,7 +1232,7 @@ export async function doAutoRecallImpl(
     cacheDetails(null);
     return null;
   } catch (e) {
-    console.warn("Auto-recall error:", e);
+    debugWarn("Auto-recall error:", e);
     cacheDetails(null);
     return null;
   }

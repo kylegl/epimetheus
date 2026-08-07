@@ -601,6 +601,7 @@ export class MockPiBuilder {
         }
         return this.tools.filter((t) => state.activeToolNames!.includes(t.name)).map((t) => t.name);
       }),
+      getAllTools: mock(() => this.tools.map((t) => ({ name: t.name }))),
       setActiveTools: mock((names: string[]) => {
         state.activeToolNames = names;
         state.setActiveToolsCalls.push(names);

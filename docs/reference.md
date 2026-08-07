@@ -35,6 +35,8 @@ Detailed configuration, tools, commands, and operational details for epimetheus.
 - [Tools](#tools)
 - [Slash Commands](#slash-commands)
 - [Known Extension Interactions](#known-extension-interactions)
+  - [Canonical Hindsight tool names](#canonical-hindsight-tool-names)
+  - [subagents](#subagents)
 
 # Configuration
 Configuration is stored in `<getAgentDir()>/epimetheus/config.json` or `config.jsonc` (JSONC has precedence). See the [Example Configuration](../README.md#example-configuration) in the main README for a practical starting point.
@@ -57,7 +59,7 @@ Configuration is stored in `<getAgentDir()>/epimetheus/config.json` or `config.j
 | `autoFlushSessionOn` | `["switch", "fork", "reload"]` | Auto-flush the current session when these lifecycle events occur. Options: `"switch"` (`/new`, `/resume`), `"fork"` (`/fork`, `/clone`), `"reload"`, `"compact"`, `"quit"` (active-session only; skipped if `"quit"` is also in `autoFlushPendingOn`), `"tree"`. See [Auto-Flush Events](#auto-flush-events). |
 | `autoFlushPendingOn` | `["quit"]` | Run the `/hindsight flush-pending`-equivalent flow on these events. Options: `"quit"`, `"startup"`. See [Auto-Flush Events](#auto-flush-events). |
 | `requireExtraContextBeforeFlush` | `false` | Block automatic flush until extra context is set via `/hindsight set-extra-context` or the `hindsight_set_extra_context` tool. Helps prevent incorrect extraction for sessions involving satire, fiction, external blog posts, or other content that could be misclassified. See [Extra Context & Flush Guard](#extra-context--flush-guard). |
-| `debug` | `false` | Enable debug mode. Logs parse pipeline timing to console and shows auto-flush block notifications that are otherwise suppressed. See [Debug Mode](#debug-mode). |
+| `debug` | `false` | Enable verbose diagnostics. Parse timings and session-start phase failures are written to `<agentdir>/epimetheus/debug.log` and mirrored to the console; auto-flush block notifications otherwise suppressed are shown. See [Debug Mode](#debug-mode). |
 
 ### Disabled Mode
 When `enabled: false`, epimetheus runs in a lightweight disabled mode. No tools, commands, API client, auto-recall, auto-retain, or status indicator are registered. However, two things are still handled:
@@ -82,10 +84,13 @@ This ensures that disabling the extension does not leave stale data in your sess
 
 When `debug: true` (or `EPIMETHEUS_DEBUG=true`), epimetheus enables additional diagnostic output:
 
-- **Parse pipeline timing**: Logs `performance.now()` timing for `parseSessionFile` and `buildMessageArrayFromParsedSession` to the console
+- **Persistent diagnostic log**: Epimetheus console output is mirrored to `<agentdir>/epimetheus/debug.log` with timestamps and levels because Pi's interactive TUI may swallow console output. Warnings and errors are persisted even when debug mode is off; verbose informational diagnostics remain debug-gated. The active file rotates at 5 MiB with two backups (`debug.log.1` and `.2`), bounding normal retained output to roughly 15 MiB; individual entries are capped at 64 KiB. Writes are synchronous, best-effort, and never throw.
+- **Parse pipeline timing**: Logs `performance.now()` timing for session parsing to the persistent log and console.
+- **Malformed-session warnings**: Malformed JSON lines skipped while parsing a session file are reported as a single aggregated warning per parse (showing up to five line numbers, then an ellipsis) rather than one warning per bad line.
+- **Session-start phase failures**: Logs the precise setup phase and stack trace when `session_start` throws.
 - **Auto-flush block notifications**: Block notifications ("Session does not allow retention", "extra context not set") are suppressed during most auto-flushes since they are transient and not useful. In debug mode, these are always shown. The one exception is `/quit` (the final chance before exit):
   - **`/quit`** always shows block notifications regardless of debug mode, so when you finally exit there will be persistent warnings if anything wasn't flushed due to missing extra context. For the default `autoFlushPendingOn: ["quit"]`, these are also mirrored to `console.warn`/`console.error` because the TUI is already gone (see [Auto-Flush Events](#auto-flush-events)).
-- **`/hindsight active-tools`**: Only available in debug mode. Shows currently active tool names for debugging tool visibility.
+- **`/hindsight active-tools`**: Only available in debug mode. Shows currently active tool names plus a registration-focused breakdown (`pi.getAllTools()`) that classifies each Hindsight tool as registered-and-active, registered-but-inactive (degraded-mode hiding or narrowed active-tool selection), or not-registered-at-all (config disabled, lazy registration has not run, or Pi excluded it before building `getAllTools()`). Runtime-state-versus-`getAllTools()` mismatches and `sourceInfo` help identify Pi-level exclusion or registration issues.
 
 ## Auto-Flush Events
 
@@ -679,13 +684,18 @@ All commands are under `/hindsight <subcommand>`. With no subcommand, defaults t
 | `popup` | Pop up last recalled messages in overlay |
 | `status` | Show operational status (connection, session, recall info, queue count) |
 | `config` | Show configuration (file path, env vars, masked config) |
-| `active-tools` | Show currently active tool names (for debugging tool visibility). Only available in [debug mode](#debug-mode). |
+| `active-tools` | Show active and registered tool names with per-Hindsight-tool registration diagnostics (for debugging tool visibility). Only available in [debug mode](#debug-mode). |
 | `parse-session` | Parse current session to local files for review (no upsert) |
 | `parse-and-upsert-session` | Parse and upsert the full current session to Hindsight (forced full re-parse, bypasses pending-marker guard) |
 
 > **Note:** After `/resume`, a new user message is required before `/hindsight popup` will show content, since recall only happens when there's a user message to query against.
 
 # Known Extension Interactions
+
+## Canonical Hindsight tool names
+
+Epimetheus reserves these exact tool names: `hindsight_set_extra_context`, `hindsight_get_extra_context`, `hindsight_retain`, `hindsight_recall`, and `hindsight_reflect`. Its visibility manager may hide these names in degraded mode or according to retention settings. Extensions that register a tool with one of the same exact names are incompatible, even when the corresponding Epimetheus tool is disabled through `toolsEnabled`. Tools that merely share the `hindsight_` prefix but use another name are preserved.
+
 ## subagents
 You should check how your subagent plugin interacts with sessions. If it writes to a separate session, and you do not want memories stored for subagents, you should disable epimetheus for subagents. A good subagent plugin should allow disabling or configuring extensions per-agent.
 

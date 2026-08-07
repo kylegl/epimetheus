@@ -9,6 +9,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import type { HindsightConfig, RetainContent, ToolFilter } from "./config";
+import { debugWarn } from "./debug-log";
 import { prepareEntry, shouldRetainMessage } from "./prepare";
 import { extractParentSessionId, getBasedir, getProjectName } from "./utils";
 
@@ -42,7 +43,7 @@ export interface SessionEntry {
 
 /**
  * Parse a session file and return header + entries.
- * Skips malformed JSON lines with a warning.
+ * Skips malformed JSON lines and emits one aggregate warning per parse.
  */
 export function parseSessionFile(sessionPath: string): {
   header: SessionHeader;
@@ -53,6 +54,7 @@ export function parseSessionFile(sessionPath: string): {
 
   let header: SessionHeader | null = null;
   const entries: SessionEntry[] = [];
+  const malformedLineNumbers: number[] = [];
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -66,8 +68,18 @@ export function parseSessionFile(sessionPath: string): {
         entries.push(parsed as SessionEntry);
       }
     } catch {
-      console.warn(`Skipping malformed JSON at line ${i + 1} in ${sessionPath}`);
+      malformedLineNumbers.push(i + 1);
     }
+  }
+
+  if (malformedLineNumbers.length > 0) {
+    const shownLines = malformedLineNumbers.slice(0, 5).join(", ");
+    const omitted = malformedLineNumbers.length > 5 ? ", ..." : "";
+    const noun = malformedLineNumbers.length === 1 ? "line" : "lines";
+    debugWarn(
+      `Skipped ${malformedLineNumbers.length} malformed JSON ${noun} in ${sessionPath} ` +
+        `(lines: ${shownLines}${omitted})`
+    );
   }
 
   if (!header) {

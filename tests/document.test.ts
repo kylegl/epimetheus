@@ -3,8 +3,8 @@
  * Covers: basic sessions, fork scenarios, compaction, bad path handling.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { HindsightConfig } from "../src/config";
@@ -21,14 +21,14 @@ import {
   getContextNameMaxLength,
   getSessionNameFromEntries,
 } from "../src/utils";
-import { HINDSIGHT_ENV_KEYS, saveEnvKeys } from "./fixtures";
+import { HINDSIGHT_ENV_KEYS, saveEnvKeys, setupTempAgentDir, testConfig } from "./fixtures";
+
+setupTempAgentDir("document");
 
 // Use a unique temp directory per test run to avoid colliding with real data
 const RUN_ID = `hindsight-doc-test-${Date.now()}`;
 const TEST_HOME = join(tmpdir(), RUN_ID, "home");
 const TEST_SESSIONS_DIR = join(TEST_HOME, ".pi/agent/sessions/test-project");
-
-import { testConfig } from "./fixtures";
 
 const defaultConfig: HindsightConfig = {
   ...testConfig,
@@ -614,6 +614,40 @@ describe("bad path handling", () => {
     expect(warning).toContain("missing header");
     expect(warning).not.toContain("Parent session file not found");
     expect(sessionId).toBe("fork-malformed-parent-session");
+  });
+
+  it("aggregates malformed JSON lines into one warning per parse", () => {
+    const path = join(TEST_SESSIONS_DIR, "malformed-lines.jsonl");
+    const lines = [
+      JSON.stringify({
+        type: "session",
+        id: "malformed-lines",
+        timestamp: new Date().toISOString(),
+        cwd: TEST_SESSIONS_DIR,
+      }),
+      "not json one",
+      JSON.stringify(userEntry("u1", null, "Valid message")),
+      "not json two",
+    ];
+    writeFileSync(path, `${lines.join("\n")}\n`);
+
+    const logPath = join(process.env.PI_CODING_AGENT_DIR!, "epimetheus", "debug.log");
+    rmSync(logPath, { force: true });
+    const originalWarn = console.warn;
+    const warn = mock(() => {});
+    console.warn = warn;
+    try {
+      const { entries } = parseSessionFile(path);
+      expect(entries).toHaveLength(1);
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    const log = readFileSync(logPath, "utf8");
+    expect(log).toContain("Skipped 2 malformed JSON lines");
+    expect(log).toContain("(lines: 2, 4)");
+    expect(log.match(/malformed JSON/g)).toHaveLength(1);
   });
 
   it("throws for session file without header", () => {

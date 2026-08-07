@@ -119,7 +119,7 @@ export interface HindsightConfig {
   retainSessionsByDefault: boolean;
   /** When true, auto-flush events are blocked (warn instead) until extra context is set via /hindsight set-extra-context or the hindsight_set_extra_context tool. Default: false. */
   requireExtraContextBeforeFlush: boolean;
-  /** When true, enable debug logging: active tool visibility checks, parse timing, etc. Default: false. */
+  /** When true, enable verbose diagnostics such as parse timing and active-tools reporting. Default: false. */
   debug: boolean;
   entities: EntityInput[];
   observationScopes: ObservationScopes;
