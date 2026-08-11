@@ -7,6 +7,12 @@
 - Update the ToC when adding new documentation headings
 - When adding `/hindsight` subcommands, add any command that does non-diagnostic or non-setup network work to `OPERATIONAL_SUBCOMMANDS` (so it's blocked until healthy startup)
 
+# Repository Remotes
+- `origin` (`kylegl/epimetheus`) is the only permitted push destination.
+- `upstream` (`noctuid/epimetheus`) is fetch-only. Never push directly to upstream or change its push URL to a working destination.
+- Keep the shared pre-push hook in the bare repository enabled; it blocks every destination except `kylegl/epimetheus`.
+- Prefer generally useful changes suitable for an upstream pull request. Keep user-specific model choices and policy defaults in consuming projects.
+
 # Testing
 - **No simulation tests**: Do not reimplement production logic in tests (e.g., copying filtering/transform logic into a test helper). This gives false confidence — the test passes even if the real code breaks. Instead, exercise the real handlers via integration tests (invoke handlers from `createMockPi()`, call `parseAndUpsertSession()`, etc.). See `tests/bootstrap.test.ts` for the pattern.
 - **Test behavior, not implementation**: Test descriptions and assertions should describe observable behavior (e.g. "recall works on first message") not implementation details (e.g. "uses event.prompt").
