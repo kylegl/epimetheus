@@ -16,8 +16,12 @@
 
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { dirname, join, resolve } from "node:path";
+import {
+  type ExtensionAPI,
+  type ExtensionContext,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import type { HindsightConfig } from "./config";
 import { ensureParsedSessionDir, getMetaPath } from "./parsed-store";
 import { touchPendingFlag } from "./queue";
@@ -261,57 +265,91 @@ export async function updateSessionMetadata(
   sessionId: string | undefined,
   entries: Array<{ type: string; customType?: string; data?: unknown }>,
   updates: Partial<HindsightMeta>,
-  config: Pick<HindsightConfig, "retainSessionsByDefault">
+  config: Pick<HindsightConfig, "retainSessionsByDefault">,
+  sessionPath?: string
 ): Promise<void> {
   const existingMeta = getHindsightMeta(entries);
+  pi.appendEntry("hindsight-meta", buildMetaUpdate(existingMeta, updates));
+  updateMetadataStateAndQueue(sessionId, entries, existingMeta, updates, config, sessionPath);
+}
+
+/** Persist metadata to either the active session or a pending non-active session. */
+export async function updateTargetSessionMetadata(
+  ctx: ExtensionContext,
+  sessionPath: string,
+  sessionId: string,
+  entries: Array<{ type: string; customType?: string; data?: unknown }>,
+  updates: Partial<HindsightMeta>,
+  config: Pick<HindsightConfig, "retainSessionsByDefault">,
+  appendActiveEntry?: (customType: string, data?: unknown) => void,
+  markPending = true
+): Promise<HindsightMeta> {
+  const existingMeta = getHindsightMeta(entries);
   const meta = buildMetaUpdate(existingMeta, updates);
-  pi.appendEntry("hindsight-meta", meta);
+  const activePath = ctx.sessionManager.getSessionFile();
+  if (activePath && resolve(activePath) === resolve(sessionPath)) {
+    if (!appendActiveEntry) {
+      throw new Error("Cannot persist generated extra context for the active session");
+    }
+    appendActiveEntry("hindsight-meta", meta);
+  } else {
+    SessionManager.open(sessionPath).appendCustomEntry("hindsight-meta", meta);
+  }
+  updateMetadataStateAndQueue(
+    sessionId,
+    entries,
+    existingMeta,
+    updates,
+    config,
+    sessionPath,
+    markPending
+  );
+  return meta;
+}
 
-  // Update live session state when relevant
-  if (sessionId) {
-    const currentState = readSessionState(sessionId);
+function updateMetadataStateAndQueue(
+  sessionId: string | undefined,
+  entries: Array<{ type: string; customType?: string; data?: unknown }>,
+  existingMeta: HindsightMeta | null,
+  updates: Partial<HindsightMeta>,
+  config: Pick<HindsightConfig, "retainSessionsByDefault">,
+  sessionPath?: string,
+  markPending = true
+): void {
+  if (!sessionId) return;
 
-    // Determine if we need to update live state
-    const needsRetainedUpdate = updates.retained !== undefined;
-    const needsExtraContextUpdate = updates.extraContext !== undefined;
+  const currentState = readSessionState(sessionId);
+  const needsRetainedUpdate = updates.retained !== undefined;
+  const needsExtraContextUpdate = updates.extraContext !== undefined;
 
-    if (needsRetainedUpdate || needsExtraContextUpdate) {
-      // Build merged state: preserve existing values, apply updates
-      const retained = needsRetainedUpdate
-        ? (updates.retained as boolean)
-        : (currentState?.retained ??
-          shouldSessionBeRetained(entries, {
-            retainSessionsByDefault: config.retainSessionsByDefault,
-          }));
-
-      const extraContext = needsExtraContextUpdate
-        ? (updates.extraContext ?? null)
-        : resolveExtraContext(currentState, existingMeta);
-
-      const newState: SessionStateFile = {
-        retained,
-        extraContext,
-        updatedAt: new Date().toISOString(),
-      };
-
-      const success = writeSessionState(sessionId, newState);
-      if (!success) {
-        // If state update fails, try to delete stale state so next flush
-        // falls back to parsing the session file
-        console.warn(`Failed to update live session state for ${sessionId}, removing stale state`);
-        if (!removeSessionState(sessionId)) {
-          console.warn(`Failed to remove stale session state for ${sessionId}`);
-        }
+  if (needsRetainedUpdate || needsExtraContextUpdate) {
+    const retained = needsRetainedUpdate
+      ? (updates.retained as boolean)
+      : (currentState?.retained ??
+        shouldSessionBeRetained(entries, {
+          retainSessionsByDefault: config.retainSessionsByDefault,
+        }));
+    const extraContext = needsExtraContextUpdate
+      ? (updates.extraContext ?? null)
+      : resolveExtraContext(currentState, existingMeta);
+    const newState: SessionStateFile = {
+      retained,
+      extraContext,
+      updatedAt: new Date().toISOString(),
+    };
+    const success = writeSessionState(sessionId, newState);
+    if (!success) {
+      console.warn(`Failed to update live session state for ${sessionId}, removing stale state`);
+      if (!removeSessionState(sessionId)) {
+        console.warn(`Failed to remove stale session state for ${sessionId}`);
       }
     }
+  }
 
-    // Changes to tags or extra context affect the retained document output,
-    // so mark the session as needing a re-flush.
-    if (updates.tags !== undefined || updates.extraContext !== undefined) {
-      const result = touchPendingFlag(sessionId);
-      if (!result.success) {
-        console.warn(`Failed to queue session for re-flush: ${result.error}`);
-      }
+  if (markPending && (updates.tags !== undefined || updates.extraContext !== undefined)) {
+    const result = touchPendingFlag(sessionId, "metadata-update", sessionPath);
+    if (!result.success) {
+      console.warn(`Failed to queue session for re-flush: ${result.error}`);
     }
   }
 }

@@ -26,9 +26,10 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 import type { ObservationScopes } from "./config";
 import {
   ensureQueueDir,
@@ -126,19 +127,34 @@ export function toolQueueExists(sessionId: string): boolean {
 // Dirty flag (pending) management
 // ============================================
 
+const MAX_PENDING_TOKEN_BYTES = 64 * 1024;
+
+interface PendingToken {
+  id: string;
+  sessionId: string;
+  sessionPath?: string;
+  createdAt: string;
+  reason: string;
+}
+
 /**
  * Create a pending marker for a session.
  * Each marker is a unique file — multiple markers can coexist.
  * Public API — no locking needed (atomic file creation).
  */
-export function touchPendingFlag(sessionId: string, reason: string = "message_end"): QueueResult {
+export function touchPendingFlag(
+  sessionId: string,
+  reason: string = "message_end",
+  sessionPath?: string
+): QueueResult {
   try {
     ensureQueueDir(sessionId);
     const tokenId = randomUUID();
     const tokenPath = getPendingTokenPath(sessionId, tokenId);
-    const token = {
+    const token: PendingToken = {
       id: tokenId,
       sessionId,
+      ...(sessionPath && isAbsolute(sessionPath) ? { sessionPath } : {}),
       createdAt: new Date().toISOString(),
       reason,
     };
@@ -155,6 +171,26 @@ export function touchPendingFlag(sessionId: string, reason: string = "message_en
 export function hasPendingFlag(sessionId: string): boolean {
   const pendingDir = getPendingDir(sessionId);
   return existsSync(pendingDir) && listJsonFiles(pendingDir).length > 0;
+}
+
+/** Return unique, absolute session-path hints from valid pending markers. */
+export function getPendingSessionPathHints(sessionId: string): string[] {
+  const pendingDir = getPendingDir(sessionId);
+  const paths = new Set<string>();
+  for (const tokenId of listJsonFiles(pendingDir)) {
+    try {
+      const tokenPath = getPendingTokenPath(sessionId, tokenId);
+      if (statSync(tokenPath).size > MAX_PENDING_TOKEN_BYTES) continue;
+      const token = JSON.parse(readFileSync(tokenPath, "utf8")) as Partial<PendingToken>;
+      if (token.sessionId !== sessionId || !token.sessionPath || !isAbsolute(token.sessionPath)) {
+        continue;
+      }
+      paths.add(token.sessionPath);
+    } catch {
+      // Corrupt or concurrently claimed markers are treated as pathless legacy markers.
+    }
+  }
+  return [...paths];
 }
 
 /**

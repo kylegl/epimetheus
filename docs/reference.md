@@ -56,7 +56,9 @@ Configuration is stored in `<getAgentDir()>/epimetheus/config.json` or `config.j
 | `constantTags` | `["harness:pi"]` | Tags included on every retained document (useful for filtering in Hindsight) |
 | `autoFlushSessionOn` | `["switch", "fork", "reload"]` | Auto-flush the current session when these lifecycle events occur. Options: `"switch"` (`/new`, `/resume`), `"fork"` (`/fork`, `/clone`), `"reload"`, `"compact"`, `"quit"` (active-session only; skipped if `"quit"` is also in `autoFlushPendingOn`), `"tree"`. See [Auto-Flush Events](#auto-flush-events). |
 | `autoFlushPendingOn` | `["quit"]` | Run the `/hindsight flush-pending`-equivalent flow on these events. Options: `"quit"`, `"startup"`. See [Auto-Flush Events](#auto-flush-events). |
-| `requireExtraContextBeforeFlush` | `false` | Block automatic flush until extra context is set via `/hindsight set-extra-context` or the `hindsight_set_extra_context` tool. Helps prevent incorrect extraction for sessions involving satire, fiction, external blog posts, or other content that could be misclassified. See [Extra Context & Flush Guard](#extra-context--flush-guard). |
+| `quitFlushTimeoutMs` | `10000` | One overall deadline, from 1 through 10000 milliseconds, for all retention work performed during quit. Unfinished work remains queued for recovery. |
+| `requireExtraContextBeforeFlush` | `false` | Block automatic flush until extra context is set manually or generated. Helps prevent incorrect extraction for sessions involving satire, fiction, external blog posts, or other content that could be misclassified. See [Extra Context & Flush Guard](#extra-context--flush-guard). |
+| `extraContextGeneration` | `null` | Optional `{ "model": "provider/model-id", "thinkingLevel": "..." }` auxiliary Pi model used to generate missing context once before the first session upsert. |
 | `debug` | `false` | Enable debug mode. Logs parse pipeline timing to console and shows auto-flush block notifications that are otherwise suppressed. See [Debug Mode](#debug-mode). |
 
 ### Disabled Mode
@@ -105,6 +107,8 @@ Two settings control which session lifecycle events automatically flush pending 
 ### Overlap: `"quit"` in both lists
 
 `"quit"` may appear in either or both lists. If it is in **both**, the pending flush (`autoFlushPendingOn`) takes precedence and the active-session quit flush is skipped to avoid duplicate work. `validateConfig` emits a warning in that case. The recommended default (`autoFlushPendingOn: ["quit"]`, `"quit"` absent from `autoFlushSessionOn`) flushes all pending sessions on `/quit`.
+
+Quit uses one `quitFlushTimeoutMs` deadline for the complete flush. Cancellation after a submission starts is reported as an unknown outcome and leaves the durable claim queued for idempotent retry. Pending markers record validated session-path hints so recovery can avoid scanning all Pi session history; unresolved or missing sessions remain queued.
 
 ## Auto-Recall Settings
 
@@ -199,11 +203,12 @@ Extra context is used in all places the Hindsight context field is used:
 - **Recall results**: Returned as a field on each memory fact
 - **Reflect agent**: Available as context for answer synthesis
 
-There are two ways to set extra context:
+There are three ways to set extra context:
 1. **Slash command**: `/hindsight set-extra-context This session involves reading Dune by Frank Herbert; characters are not the user`
 2. **Tool**: `hindsight_set_extra_context` — the LLM can set extra context directly (useful when the model recognizes the need or at the end of a session - ask model to summarize the overall session and provide necessary context to avoid out-of-context/incorrect memories)
+3. **Automatic generation**: configure `extraContextGeneration` with an exact Pi `provider/model-id` and thinking level. Before the first eligible session upsert, Epimetheus sends only the configured retained message projection to that auxiliary model and persists its concise caveats in the target session.
 
-Call with no text (`/hindsight set-extra-context`) to indicate no extra context is needed (satisfies the flush guard).
+Call with no text (`/hindsight set-extra-context`) to indicate no extra context is needed (satisfies the flush guard). Manual non-empty and explicitly empty values always take precedence over automatic generation. Generation failure blocks the upsert and preserves pending work for retry; it never stores an error as context or changes Pi's active model.
 
 ### Flush Guard
 
@@ -611,6 +616,8 @@ Configuration options can also be set via environment variables (override config
 | `EPIMETHEUS_AUTO_FLUSH_SESSION_ON` | `autoFlushSessionOn` | string[] (JSON) | `["switch", "fork", "reload"]` |
 | `EPIMETHEUS_AUTO_FLUSH_PENDING_ON` | `autoFlushPendingOn` | string[] (JSON) | `["quit"]` |
 | `EPIMETHEUS_REQUIRE_EXTRA_CONTEXT_BEFORE_FLUSH` | `requireExtraContextBeforeFlush` | boolean | `false` |
+| `EPIMETHEUS_EXTRA_CONTEXT_GENERATION` | `extraContextGeneration` | object (JSON) | `null` |
+| `EPIMETHEUS_QUIT_FLUSH_TIMEOUT_MS` | `quitFlushTimeoutMs` | integer | `10000` |
 | `EPIMETHEUS_RETAIN_SESSIONS_BY_DEFAULT` | `retainSessionsByDefault` | boolean | `true` |
 | `EPIMETHEUS_RETAIN_CONTENT` | `retainContent` | RetainContent (JSON) | *(see retainContent default)* |
 | `EPIMETHEUS_STRIP` | `strip` | StripConfig (JSON) | *(see strip default)* |

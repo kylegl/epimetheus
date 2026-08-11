@@ -21,6 +21,7 @@ import {
   type SessionEntry,
   type SessionHeader,
 } from "./document";
+import { generateExtraContext } from "./extra-context";
 import {
   buildMetaFile,
   FLUSH_BLOCKED_NO_EXTRA_CONTEXT,
@@ -29,6 +30,7 @@ import {
   isExtraContextSet,
   type MetaFile,
   shouldSessionBeRetained,
+  updateTargetSessionMetadata,
   writeMetaFile,
 } from "./meta";
 import { resolveParsedSessionMetadata, writeMessagesJsonl } from "./parsed-store";
@@ -44,9 +46,25 @@ import {
   readClaimedToolEntries,
   recoverStaleInflightClaims,
   restoreClaim,
+  touchPendingFlag,
 } from "./queue";
 import { readSessionState, type SessionStateFile, writeSessionState } from "./session-state";
 import { getBasedir, getProjectName } from "./utils";
+
+const RETENTION_OUTCOME_UNKNOWN =
+  "Retention submission did not finish before cancellation; pending work was preserved for retry.";
+const RETENTION_CANCELLED_BEFORE_SUBMIT =
+  "Retention was cancelled before submission; pending work was preserved for retry.";
+
+class RetentionOutcomeUnknownError extends Error {}
+class RetentionCancelledBeforeSubmitError extends Error {}
+
+function retentionCancellationMessage(error: unknown): string | undefined {
+  if (error instanceof RetentionOutcomeUnknownError) return RETENTION_OUTCOME_UNKNOWN;
+  if (error instanceof RetentionCancelledBeforeSubmitError)
+    return RETENTION_CANCELLED_BEFORE_SUBMIT;
+  return undefined;
+}
 
 /**
  * Queue a tool retain entry with complete tags.
@@ -145,8 +163,12 @@ export async function flushToolQueue(
   options?: { notifySuccess?: boolean }
 ): Promise<{ success: boolean; error?: string; count: number }> {
   const fail = (error: unknown): { success: false; error: string; count: 0 } => {
-    const msg = error instanceof Error ? error.message : String(error);
-    ctx.ui.notify(`Failed to flush tool queue: ${msg}`, "error");
+    const cancellation = retentionCancellationMessage(error);
+    const msg = cancellation ?? (error instanceof Error ? error.message : String(error));
+    ctx.ui.notify(
+      cancellation ?? `Failed to flush tool queue: ${msg}`,
+      cancellation ? "warning" : "error"
+    );
     return { success: false, error: msg, count: 0 };
   };
 
@@ -185,7 +207,8 @@ export async function flushToolQueue(
     }
 
     const items = entries.map(toolQueueEntryToMemoryItem);
-    const result = await client.retainBatch(items, signal);
+    if (signal?.aborted) throw new RetentionCancelledBeforeSubmitError();
+    const result = await awaitWithAbort(client.retainBatch(items), signal);
 
     if (result.success) {
       completeClaim(claim);
@@ -241,6 +264,7 @@ export async function flushCurrentSession(
     autoFlush?: boolean;
     surfaceBlocks?: boolean;
     notifySuccess?: boolean;
+    appendActiveEntry?: (customType: string, data?: unknown) => void;
   }
 ): Promise<void> {
   try {
@@ -259,6 +283,7 @@ export async function flushCurrentSession(
         autoFlush: options?.autoFlush,
         surfaceBlocks: options?.surfaceBlocks,
         notifySuccess: options?.notifySuccess,
+        appendActiveEntry: options?.appendActiveEntry,
       });
       sessionHadPendingWork = true;
     } else {
@@ -322,8 +347,9 @@ export async function upsertToHindsight(
     projectName ?? getProjectName(params.sessionCwd)
   );
 
-  const result = await client.retain(
-    {
+  if (signal?.aborted) throw new RetentionCancelledBeforeSubmitError();
+  const result = await awaitWithAbort(
+    client.retain({
       content: params.content,
       documentId: params.documentId,
       context: params.context,
@@ -332,7 +358,7 @@ export async function upsertToHindsight(
       updateMode: "replace",
       entities: config.entities.length > 0 ? config.entities : undefined,
       observationScopes: expandedScopes,
-    },
+    }),
     signal
   );
 
@@ -376,7 +402,11 @@ function preFlushCheck(
     };
   }
 
-  if (config.requireExtraContextBeforeFlush && !isExtraContextSet(liveState.extraContext)) {
+  if (
+    config.requireExtraContextBeforeFlush &&
+    !config.extraContextGeneration &&
+    !isExtraContextSet(liveState.extraContext)
+  ) {
     return {
       blocked: true,
       result: { message: FLUSH_BLOCKED_NO_EXTRA_CONTEXT, level: "warning" },
@@ -390,6 +420,33 @@ function preFlushCheck(
 // ============================================
 // parseAndUpsertSession helpers
 // ============================================
+
+/**
+ * Stop awaiting at lifecycle cancellation without aborting a submission that may
+ * already have been accepted by the server. The caller restores the durable
+ * claim and reports the result as unknown rather than as a transport failure.
+ */
+function awaitWithAbort<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return operation;
+  if (signal.aborted) return Promise.reject(new RetentionOutcomeUnknownError());
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      signal.removeEventListener("abort", abort);
+      reject(new RetentionOutcomeUnknownError());
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    operation.then(
+      (result) => {
+        signal.removeEventListener("abort", abort);
+        resolve(result);
+      },
+      (error) => {
+        signal.removeEventListener("abort", abort);
+        reject(error);
+      }
+    );
+  });
+}
 
 /**
  * Handle the retention-disabled fast-block: clear pending markers and optionally notify.
@@ -571,6 +628,8 @@ export async function parseAndUpsertSession(
     autoFlush?: boolean;
     surfaceBlocks?: boolean;
     notifySuccess?: boolean;
+    generateExtraContext?: typeof generateExtraContext;
+    appendActiveEntry?: (customType: string, data?: unknown) => void;
   }
 ): Promise<void> {
   // Fast-path blocking checks using live state
@@ -593,6 +652,7 @@ export async function parseAndUpsertSession(
   }
 
   let claim: QueueClaim | null = null;
+  let generatedContextPersisted = false;
   const debug = config.debug;
   try {
     claim = claimPendingFlag(sessionId);
@@ -623,7 +683,7 @@ export async function parseAndUpsertSession(
         `Session ID mismatch: expected ${sessionId} but session file header has ${header.id}`
       );
     }
-    const hindsightMeta = getHindsightMeta(entries);
+    let hindsightMeta = getHindsightMeta(entries);
     const liveState = preCheck.liveState;
 
     // After parsing, session file is the sole authority for retention.
@@ -648,9 +708,13 @@ export async function parseAndUpsertSession(
 
     // Extra context check: derive from parsed entries, not live state.
     // Live state was only used for pre-parse fast guard above.
-    const parsedExtraContext =
+    let parsedExtraContext =
       hindsightMeta && "extraContext" in hindsightMeta ? (hindsightMeta.extraContext ?? "") : null;
-    if (config.requireExtraContextBeforeFlush && !isExtraContextSet(parsedExtraContext)) {
+    if (
+      config.requireExtraContextBeforeFlush &&
+      !config.extraContextGeneration &&
+      !isExtraContextSet(parsedExtraContext)
+    ) {
       // Write/update live state so future flushes can fast-block without reparsing
       updateLiveStateFromParsed(sessionId, true, parsedExtraContext, liveState);
       if (claim) restoreClaim(claim);
@@ -726,6 +790,36 @@ export async function parseAndUpsertSession(
     }
     const resolvedProjectName = projectNameResult.projectName;
 
+    if (config.extraContextGeneration && !isExtraContextSet(parsedExtraContext)) {
+      const generated = await (options?.generateExtraContext ?? generateExtraContext)(
+        messages,
+        config.extraContextGeneration,
+        ctx,
+        signal
+      );
+      hindsightMeta = await updateTargetSessionMetadata(
+        ctx,
+        sessionPath,
+        sessionId,
+        entries,
+        { extraContext: generated.text },
+        config,
+        options?.appendActiveEntry,
+        false
+      );
+      generatedContextPersisted = true;
+      parsedExtraContext = generated.text;
+    }
+
+    if (config.requireExtraContextBeforeFlush && !isExtraContextSet(parsedExtraContext)) {
+      updateLiveStateFromParsed(sessionId, true, parsedExtraContext, liveState);
+      if (claim) restoreClaim(claim);
+      if (!options?.autoFlush || debug || options?.surfaceBlocks) {
+        ctx.ui.notify(FLUSH_BLOCKED_NO_EXTRA_CONTEXT, "warning");
+      }
+      return;
+    }
+
     // Resolve metadata from parsed session data (session file is authority, not live state)
     const resolved = resolveSessionFlushMetadata(
       header,
@@ -785,6 +879,12 @@ export async function parseAndUpsertSession(
       ctx.ui.notify(`Parsed and upserted ${formattedStrs.length} messages`, "info");
     }
   } catch (e) {
+    if (!claim && generatedContextPersisted) {
+      const result = touchPendingFlag(sessionId, "generated-extra-context", sessionPath);
+      if (!result.success) {
+        console.warn(`Failed to queue generated extra context for retry: ${result.error}`);
+      }
+    }
     if (claim) {
       const combinedMsg = restoreClaimAfterFailure(claim, e);
       if (combinedMsg) {
@@ -792,8 +892,9 @@ export async function parseAndUpsertSession(
         return;
       }
     }
-    const msg = e instanceof Error ? e.message : String(e);
-    ctx.ui.notify(msg, "error");
+    const cancellation = retentionCancellationMessage(e);
+    const message = cancellation ?? (e instanceof Error ? e.message : String(e));
+    ctx.ui.notify(message, cancellation ? "warning" : "error");
   }
 }
 

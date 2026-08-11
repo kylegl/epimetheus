@@ -60,12 +60,13 @@ A pending marker is a tiny work marker:
 {
   "id": "...",
   "sessionId": "...",
+  "sessionPath": "/optional/absolute/session/path.jsonl",
   "createdAt": "...",
   "reason": "message_end"
 }
 ```
 
-It does not contain the session content or metadata. It only means:
+It does not contain session content. The optional absolute path is only a validated resolution hint so startup and quit recovery can avoid listing all Pi sessions. Invalid, ambiguous, stale, or absent hints fall back to bounded targeted discovery, and unresolved work remains queued. The marker means:
 
 > This session may need to be reparsed and upserted.
 
@@ -116,13 +117,15 @@ Session flushing follows this high-level flow:
 3. Claim current pending markers by renaming them into `pending/.inflight/<claim-id>/`.
 4. If no markers were claimed, there is no session work to flush.
 5. Parse the Pi session JSONL file for conversation messages, structural identity, and the latest `hindsight-meta` entry.
-6. Apply retention and extra-context guard checks using metadata derived from the freshly parsed session file; update live session state from the parsed metadata for future fast checks.
-7. Combine parsed message data, header-derived structural identity, user-controlled metadata, and config/env-derived metadata.
-8. Upsert the session document to Hindsight with replace/idempotent semantics.
-9. Write parsed-session files (`.messages.jsonl` for review/export and `.meta.json` for session metadata).
-10. Delete the claim directory and claimed pending markers.
+6. Apply retention and extra-context guard checks using metadata derived from the freshly parsed session file.
+7. If automatic extra-context generation is configured and context was never set, invoke the configured auxiliary Pi model with the retained message projection and append the generated context to the active or target session before submission.
+8. Update live session state from parsed metadata for future fast checks.
+9. Combine parsed message data, header-derived structural identity, user-controlled metadata, and config/env-derived metadata.
+10. Upsert the session document to Hindsight with replace/idempotent semantics.
+11. Write parsed-session files (`.messages.jsonl` for review/export and `.meta.json` for session metadata).
+12. Delete the claim directory and claimed pending markers.
 
-If new messages or metadata changes happen during steps 5-9, they create new pending markers in `pending/`. Those markers are outside the active claim and survive for a future flush.
+If new messages or metadata changes happen during steps 5-12, they create new pending markers in `pending/`. Those markers are outside the active claim and survive for a future flush.
 
 If the flush fails, claimed pending markers are moved back to `pending/` so the session can be retried.
 

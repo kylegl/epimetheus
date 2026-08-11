@@ -208,6 +208,14 @@ Configuration is stored in `<getAgentDir()>/epimetheus/config.json` or `config.j
   // require extra context to be set before flushing prevents accidental retention
   // of fiction or content not about the user that could be misclassified by extraction
   // "requireExtraContextBeforeFlush": true,
+  // optionally generate missing context once with a dedicated Pi model;
+  // manual non-empty or explicitly empty context always takes precedence
+  // "extraContextGeneration": {
+  //   "model": "provider/model-id",
+  //   "thinkingLevel": "medium"
+  // },
+  // one overall deadline for all retention work during quit
+  // "quitFlushTimeoutMs": 10000,
 }
 ```
 

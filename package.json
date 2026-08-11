@@ -47,7 +47,8 @@
     "check:fix": "biome check . --write && sed -i'' -e 's/[[:space:]]*$//' src/*.ts *.md",
     "typecheck": "bun run --bun tsc --noEmit",
     "commitlint": "commitlint",
-    "ci": "bun run check && bun run typecheck && bun test --isolate"
+    "test": "bun test --isolate tests/client.test.ts && bun test --isolate $(find tests -maxdepth 1 -name '*.test.ts' ! -name 'client.test.ts' -print | sort)",
+    "ci": "bun run check && bun run typecheck && bun run test"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.12",
@@ -56,6 +57,7 @@
     "@types/bun": "latest"
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },

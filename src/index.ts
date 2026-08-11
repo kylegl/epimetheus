@@ -5,6 +5,7 @@
  * turn-based flush with Hindsight's replace mode.
  */
 
+import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Box, type Component, Text } from "@earendil-works/pi-tui";
 import type { RecallResponse } from "@vectorize-io/hindsight-client";
@@ -469,7 +470,11 @@ export default function (pi: ExtensionAPI) {
     // reason-gated to `session_start` only — it is a best-effort cleanup of old
     // pending sessions, not a readiness prerequisite.
     if (event.reason === "startup" && config.autoFlushPendingOn.includes("startup") && client) {
-      await flushAllPending(config, client, ctx, { notifyNoWork: false, autoFlush: true });
+      await flushAllPending(config, client, ctx, {
+        notifyNoWork: false,
+        autoFlush: true,
+        appendActiveEntry: (customType, data) => pi.appendEntry(customType, data),
+      });
     }
   });
 
@@ -656,8 +661,12 @@ export default function (pi: ExtensionAPI) {
     // Check if this message type should be retained
     if (!shouldRetainMessage(message, config.retainContent, config.toolFilter)) return;
 
-    // Touch the pending marker — session needs re-upsert on next flush
-    const result = touchPendingFlag(sessionId);
+    // Record a persisted path when available so recovery can avoid scanning
+    // session history. A pathless marker still preserves work before Pi writes
+    // a new session file.
+    const sessionPath = ctx.sessionManager.getSessionFile();
+    const persistedPath = sessionPath && existsSync(sessionPath) ? sessionPath : undefined;
+    const result = touchPendingFlag(sessionId, "message_end", persistedPath);
     if (!result.success) {
       ctx.ui.notify(`Failed to queue session for retention: ${result.error}`, "warning");
     }
@@ -671,6 +680,7 @@ export default function (pi: ExtensionAPI) {
     if (!sessionId || !sessionPath) return;
     await flushCurrentSession(sessionId, sessionPath, config, client, ctx, ctx.signal, {
       autoFlush: true,
+      appendActiveEntry: (customType, data) => pi.appendEntry(customType, data),
     });
   };
 
@@ -808,6 +818,7 @@ export default function (pi: ExtensionAPI) {
     const { ctx: captureCtx, replay } = withNotifyCapture(ctx);
     await flushCurrentSession(sessionId, sessionPath, config, client, captureCtx, ctx.signal, {
       autoFlush: true,
+      appendActiveEntry: (customType, data) => pi.appendEntry(customType, data),
     });
     // Replay captured notifications after the handler unwinds so they reach a
     // settled TUI instead of being swallowed mid-compact.
@@ -836,26 +847,53 @@ export default function (pi: ExtensionAPI) {
       if (!sessionId || !sessionPath) return;
       await flushCurrentSession(sessionId, sessionPath, config, client, ctx, ctx.signal, {
         autoFlush: true,
+        appendActiveEntry: (customType, data) => pi.appendEntry(customType, data),
       });
       return;
     }
     if (event.reason === "quit") {
-      if (config.autoFlushPendingOn.includes("quit")) {
-        await flushAllPending(config, client, ctx, {
-          notifyNoWork: false,
-          ctxWrapper: withWarningErrorConsoleEcho,
-        });
-        return;
-      }
-      if (config.autoFlushSessionOn.includes("quit")) {
-        const sessionId = ctx.sessionManager.getSessionId();
-        const sessionPath = ctx.sessionManager.getSessionFile();
-        if (!sessionId || !sessionPath) return;
-        const flushCtx = withWarningErrorConsoleEcho(ctx);
-        await flushCurrentSession(sessionId, sessionPath, config, client, flushCtx, ctx.signal, {
-          autoFlush: false,
-          surfaceBlocks: true,
-        });
+      // The shutdown context signal may abort as soon as teardown begins. Use
+      // one independent deadline for the complete quit flush instead of a new
+      // timeout for every pending item.
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      const timer = setTimeout(abort, config.quitFlushTimeoutMs ?? 10000);
+      const deadlineCtx = new Proxy(ctx as object, {
+        get(target, prop, receiver) {
+          if (prop === "signal") return controller.signal;
+          return Reflect.get(target, prop, receiver);
+        },
+      }) as ExtensionContext;
+      try {
+        if (config.autoFlushPendingOn.includes("quit")) {
+          await flushAllPending(config, client, deadlineCtx, {
+            notifyNoWork: false,
+            ctxWrapper: withWarningErrorConsoleEcho,
+            appendActiveEntry: (customType, data) => pi.appendEntry(customType, data),
+          });
+          return;
+        }
+        if (config.autoFlushSessionOn.includes("quit")) {
+          const sessionId = deadlineCtx.sessionManager.getSessionId();
+          const sessionPath = deadlineCtx.sessionManager.getSessionFile();
+          if (!sessionId || !sessionPath) return;
+          const flushCtx = withWarningErrorConsoleEcho(deadlineCtx);
+          await flushCurrentSession(
+            sessionId,
+            sessionPath,
+            config,
+            client,
+            flushCtx,
+            controller.signal,
+            {
+              autoFlush: false,
+              surfaceBlocks: true,
+              appendActiveEntry: (customType, data) => pi.appendEntry(customType, data),
+            }
+          );
+        }
+      } finally {
+        clearTimeout(timer);
       }
     }
   });

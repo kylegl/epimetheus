@@ -80,6 +80,22 @@ export type TagGroupInput = TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | 
 /** Role used when injecting auto-recall messages into the LLM context. */
 export type AutoRecallRole = "user" | "assistant";
 
+export type ExtraContextThinkingLevel =
+  | "off"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
+
+export interface ExtraContextGenerationConfig {
+  /** Exact Pi model reference in provider/model-id form. */
+  model: string;
+  /** Reasoning effort for the auxiliary generation call. */
+  thinkingLevel: ExtraContextThinkingLevel;
+}
+
 export type ToolName = "retain" | "recall" | "reflect" | "set_extra_context" | "get_extra_context";
 
 const VALID_TOOL_NAMES: ToolName[] = [
@@ -119,6 +135,8 @@ export interface HindsightConfig {
   retainSessionsByDefault: boolean;
   /** When true, auto-flush events are blocked (warn instead) until extra context is set via /hindsight set-extra-context or the hindsight_set_extra_context tool. Default: false. */
   requireExtraContextBeforeFlush: boolean;
+  /** Generate per-session extra context once before the first flush where it is still unset. */
+  extraContextGeneration?: ExtraContextGenerationConfig | null;
   /** When true, enable debug logging: active tool visibility checks, parse timing, etc. Default: false. */
   debug: boolean;
   entities: EntityInput[];
@@ -129,6 +147,8 @@ export interface HindsightConfig {
   autoFlushSessionOn: Array<"switch" | "fork" | "reload" | "compact" | "quit" | "tree">;
   /** Auto-flush pending work beyond the current active session when these events occur. Currently supports "quit" and "startup". */
   autoFlushPendingOn: Array<"quit" | "startup">;
+  /** Overall lifecycle deadline for quit flushing. */
+  quitFlushTimeoutMs?: number;
 }
 
 const VALID_MEMORY_TYPES = ["world", "experience", "observation"] as const;
@@ -197,6 +217,8 @@ const DEFAULT_CONFIG: HindsightConfig = {
   autoFlushPendingOn: ["quit"],
   retainSessionsByDefault: true,
   requireExtraContextBeforeFlush: false,
+  extraContextGeneration: null,
+  quitFlushTimeoutMs: 10000,
   entities: [],
   observationScopes: null,
   statusHealthy: "🧠",
@@ -233,6 +255,8 @@ const VALID_CONFIG_KEYS = new Set<keyof HindsightConfig>([
   "toolFilter",
   "retainSessionsByDefault",
   "requireExtraContextBeforeFlush",
+  "extraContextGeneration",
+  "quitFlushTimeoutMs",
   "debug",
   "entities",
   "observationScopes",
@@ -601,7 +625,8 @@ function setConfigValue(
       );
     }
     case "hindsightContextMaxLength":
-    case "recallMaxQueryChars": {
+    case "recallMaxQueryChars":
+    case "quitFlushTimeoutMs": {
       if (typeof value === "number" && Number.isFinite(value)) {
         config[key] = value;
         return;
@@ -800,6 +825,23 @@ function setConfigValue(
     case "toolFilter":
       // Replace entirely (not merge) - user must provide complete object
       return setObjectField(config, key, value);
+    case "extraContextGeneration": {
+      if (value === null || value === undefined || value === "") {
+        config[key] = null;
+        return;
+      }
+      if (typeof value === "string") {
+        try {
+          config[key] = JSON.parse(value) as ExtraContextGenerationConfig;
+          return;
+        } catch {
+          config[key] = value as unknown as ExtraContextGenerationConfig;
+          return;
+        }
+      }
+      config[key] = value as ExtraContextGenerationConfig;
+      return;
+    }
     case "observationScopes": {
       if (value === null || value === undefined || value === "") {
         config[key] = null;
@@ -1240,6 +1282,11 @@ export function loadConfig(extensionsDir?: string): {
       legacy: ["PI_HINDSIGHT_REQUIRE_EXTRA_CONTEXT_BEFORE_FLUSH"],
     },
     {
+      configKey: "extraContextGeneration",
+      preferred: "EPIMETHEUS_EXTRA_CONTEXT_GENERATION",
+      legacy: ["PI_HINDSIGHT_EXTRA_CONTEXT_GENERATION"],
+    },
+    {
       configKey: "retainContent",
       preferred: "EPIMETHEUS_RETAIN_CONTENT",
       legacy: ["PI_HINDSIGHT_RETAIN_CONTENT"],
@@ -1279,6 +1326,10 @@ export function loadConfig(extensionsDir?: string): {
       configKey: "autoFlushPendingOn",
       preferred: "EPIMETHEUS_AUTO_FLUSH_PENDING_ON",
       legacy: ["PI_HINDSIGHT_AUTO_FLUSH_PENDING_ON"],
+    },
+    {
+      configKey: "quitFlushTimeoutMs",
+      preferred: "EPIMETHEUS_QUIT_FLUSH_TIMEOUT_MS",
     },
     { configKey: "debug", preferred: "EPIMETHEUS_DEBUG", legacy: ["PI_HINDSIGHT_DEBUG"] },
   ];
@@ -1391,6 +1442,42 @@ export function validateConfig(config: HindsightConfig): {
     warnings.push(
       `hindsightContextPrefix ("${config.hindsightContextPrefix}", ${config.hindsightContextPrefix.length} chars) is longer than hindsightContextMaxLength (${config.hindsightContextMaxLength}). Auto-derived session names will not be truncated. Consider increasing hindsightContextMaxLength.`
     );
+  }
+
+  if (config.extraContextGeneration != null) {
+    const generation = config.extraContextGeneration;
+    const validThinkingLevels: ExtraContextThinkingLevel[] = [
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ];
+    const model =
+      typeof generation === "object" && generation !== null && !Array.isArray(generation)
+        ? generation.model
+        : undefined;
+    const thinkingLevel =
+      typeof generation === "object" && generation !== null && !Array.isArray(generation)
+        ? generation.thinkingLevel
+        : undefined;
+    const slash = typeof model === "string" ? model.indexOf("/") : -1;
+    if (
+      typeof model !== "string" ||
+      model !== model.trim() ||
+      /\s/.test(model) ||
+      slash <= 0 ||
+      slash === model.length - 1 ||
+      typeof thinkingLevel !== "string" ||
+      !validThinkingLevels.includes(thinkingLevel as ExtraContextThinkingLevel)
+    ) {
+      errors.push(
+        'extraContextGeneration must be { "model": "provider/model-id", "thinkingLevel": "off|minimal|low|medium|high|xhigh|max" }. Using default: null.'
+      );
+      config.extraContextGeneration = null;
+    }
   }
 
   // Validate recallMaxQueryChars - reset to default if out of range
@@ -1764,6 +1851,19 @@ export function validateConfig(config: HindsightConfig): {
         "Both autoRecallTags and autoRecallTagGroups are set. Both will be sent to the recall API — tags/tagsMatch and tag_groups are combined. Consider using only autoRecallTagGroups if you want all tag logic in one place."
       );
     }
+  }
+
+  if (
+    config.quitFlushTimeoutMs !== undefined &&
+    (typeof config.quitFlushTimeoutMs !== "number" ||
+      !Number.isInteger(config.quitFlushTimeoutMs) ||
+      config.quitFlushTimeoutMs < 1 ||
+      config.quitFlushTimeoutMs > 10000)
+  ) {
+    warnings.push(
+      "quitFlushTimeoutMs must be an integer from 1 through 10000. Using safe default."
+    );
+    config.quitFlushTimeoutMs = 10000;
   }
 
   // Validate autoFlushSessionOn / autoFlushPendingOn

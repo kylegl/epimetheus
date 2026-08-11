@@ -1500,6 +1500,37 @@ describe("real entrypoint bootstrap", () => {
     removePendingFlag(BOOTSTRAP_SESSION);
   });
 
+  it("message_end preserves retention intent before the session file exists", async () => {
+    const pi = createMockPi();
+    const extension = await import("../src/index");
+    extension.default(pi);
+    await runHealthySessionStart(pi);
+
+    const handler = pi.handlers.get("message_end")!;
+    const baseCtx = createMockContext({ _sessionId: BOOTSTRAP_SESSION });
+    const ctx = {
+      ...baseCtx,
+      sessionManager: {
+        ...baseCtx.sessionManager,
+        getSessionFile: mock(() => "/path/that/does/not/exist.jsonl"),
+      },
+    } as unknown as ExtensionContext;
+    const { removePendingFlag, hasPendingFlag } =
+      require("../src/queue") as typeof import("../src/queue");
+    removePendingFlag(BOOTSTRAP_SESSION);
+
+    await handler(
+      {
+        type: "message_end",
+        message: { role: "user", content: [{ type: "text", text: "Hello" }] },
+      },
+      ctx
+    );
+
+    expect(hasPendingFlag(BOOTSTRAP_SESSION)).toBe(true);
+    removePendingFlag(BOOTSTRAP_SESSION);
+  });
+
   it("message_end handler does not queue system messages", async () => {
     const pi = createMockPi();
     const extension = await import("../src/index");
@@ -1898,6 +1929,68 @@ describe("real entrypoint bootstrap", () => {
       removePendingFlag(BOOTSTRAP_SESSION);
       clearSessionQueueState(BOOTSTRAP_SESSION);
       cleanupParsedArtifacts(BOOTSTRAP_SESSION);
+    }
+  });
+
+  it("session_shutdown quit applies one overall deadline and preserves hanging work", async () => {
+    activeConfig = {
+      ...testConfig,
+      autoFlushPendingOn: ["quit"],
+      quitFlushTimeoutMs: 10000,
+    };
+
+    let releaseDeadline: (() => void) | undefined;
+    let retainBatchCalls = 0;
+    activeClientFactory = () => ({
+      healthCheck: mock(() => Promise.resolve({ success: true })),
+      getServerVersion: mock(() => Promise.resolve({ success: true, version: "0.9.0" })),
+      retain: mock(() => Promise.resolve({ success: true })),
+      retainBatch: mock(() => {
+        retainBatchCalls += 1;
+        queueMicrotask(() => releaseDeadline?.());
+        return new Promise<never>(() => {});
+      }),
+      recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
+      reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+    });
+
+    const pi = createMockPi();
+    const extension = await import("../src/index");
+    extension.default(pi);
+    await runHealthySessionStart(pi);
+
+    const { enqueueToolMessage, toolQueueExists, clearSessionQueueState } =
+      require("../src/queue") as typeof import("../src/queue");
+    expect(
+      enqueueToolMessage(BOOTSTRAP_SESSION, {
+        content: "recover after quit",
+        sessionId: BOOTSTRAP_SESSION,
+        store_method: "tool",
+        timestamp: "2026-01-01T00:00:00.000Z",
+      }).success
+    ).toBe(true);
+
+    const originalSetTimeout = globalThis.setTimeout;
+    const scheduled: number[] = [];
+    globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number) => {
+      scheduled.push(delay ?? 0);
+      if (delay === 10000) {
+        releaseDeadline = () => callback();
+        return 1 as never;
+      }
+      return originalSetTimeout(callback, delay);
+    }) as typeof setTimeout;
+
+    try {
+      const ctx = createMockContext({ _sessionId: BOOTSTRAP_SESSION });
+      await pi.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, ctx);
+
+      expect(scheduled.filter((delay) => delay === 10000)).toHaveLength(1);
+      expect(retainBatchCalls).toBe(1);
+      expect(toolQueueExists(BOOTSTRAP_SESSION)).toBe(true);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      clearSessionQueueState(BOOTSTRAP_SESSION);
     }
   });
 

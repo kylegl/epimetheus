@@ -160,10 +160,10 @@ export function registerCommands(
   const AUTO_RECALL_CACHE_SUBCOMMANDS = new Set(["popup"]);
 
   const subcommands: Record<string, Subcommand> = {
-    flush: createFlushSubcommand(client, config),
-    "flush-pending": createFlushPendingSubcommand(client, config),
+    flush: createFlushSubcommand(pi, client, config),
+    "flush-pending": createFlushPendingSubcommand(pi, client, config),
     "parse-session": createParseSessionSubcommand(config),
-    "parse-and-upsert-session": createParseAndUpsertSessionSubcommand(client, config),
+    "parse-and-upsert-session": createParseAndUpsertSessionSubcommand(pi, client, config),
     ...(config.debug
       ? {
           "active-tools": {

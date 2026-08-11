@@ -31,8 +31,9 @@ async function enableRetention(
   // extra context later. The guard only blocks actual upserts (flush,
   // parse-and-upsert).
   const sessionId = ctx.sessionManager.getSessionId();
+  const sessionPath = ctx.sessionManager.getSessionFile();
 
-  await updateSessionMetadata(pi, sessionId, entries, { retained: true }, config);
+  await updateSessionMetadata(pi, sessionId, entries, { retained: true }, config, sessionPath);
 
   if (isToolEnabled(config, "retain")) {
     refreshToolVisibility(pi, true);
@@ -42,7 +43,7 @@ async function enableRetention(
   // run (missing session file, network/parse error), the session is still
   // marked dirty and will be retained on the next flush.
   if (sessionId) {
-    const result = touchPendingFlag(sessionId, "toggle-retain-on");
+    const result = touchPendingFlag(sessionId, "toggle-retain-on", sessionPath);
     if (!result.success) {
       ctx.ui.notify(`Failed to queue session for retention: ${result.error}`, "warning");
     }
@@ -62,12 +63,12 @@ async function enableRetention(
   }
 
   // Parse and upsert the full session
-  const sessionPath = ctx.sessionManager.getSessionFile();
   ctx.ui.notify("Session retention: enabled", "info");
 
   if (sessionId && sessionPath) {
     await parseAndUpsertSession(sessionPath, sessionId, config, client, ctx, ctx.signal, {
       requirePending: false,
+      appendActiveEntry: (customType, data) => pi.appendEntry(customType, data),
     });
   } else {
     ctx.ui.notify("Session file not found — could not parse and upsert", "warning");
@@ -174,7 +175,14 @@ export function createTagSubcommand(pi: ExtensionAPI, config: HindsightConfig): 
       tags.push(tag);
 
       const sessionId = ctx.sessionManager.getSessionId();
-      await updateSessionMetadata(pi, sessionId, entries, { tags }, config);
+      await updateSessionMetadata(
+        pi,
+        sessionId,
+        entries,
+        { tags },
+        config,
+        ctx.sessionManager.getSessionFile()
+      );
 
       ctx.ui.notify(`Tag "${tag}" added`, "info");
     },
@@ -210,7 +218,14 @@ export function createRemoveTagSubcommand(pi: ExtensionAPI, config: HindsightCon
       tags.splice(index, 1);
 
       const sessionId = ctx.sessionManager.getSessionId();
-      await updateSessionMetadata(pi, sessionId, entries, { tags }, config);
+      await updateSessionMetadata(
+        pi,
+        sessionId,
+        entries,
+        { tags },
+        config,
+        ctx.sessionManager.getSessionFile()
+      );
 
       ctx.ui.notify(`Tag "${tag}" removed`, "info");
     },
@@ -252,7 +267,14 @@ export function createExtraContextSubcommand(
       // Always store extraContext (even empty string) so the flush guard
       // can distinguish "explicitly set to empty" from "never set".
       const sessionId = ctx.sessionManager.getSessionId();
-      await updateSessionMetadata(pi, sessionId, entries, { extraContext }, config);
+      await updateSessionMetadata(
+        pi,
+        sessionId,
+        entries,
+        { extraContext },
+        config,
+        ctx.sessionManager.getSessionFile()
+      );
 
       if (extraContext) {
         ctx.ui.notify(`Extra context set`, "info");

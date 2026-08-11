@@ -2,6 +2,21 @@
 
 ## Pending
 
+### Features
+
+- **Configured automatic extra context** — Added optional `extraContextGeneration` settings for an exact Pi `provider/model-id` and thinking level. Missing context is generated once from the retained message projection and persisted before the first session upsert; manual empty or non-empty context takes precedence.
+- **Bounded pending-session recovery** — Pending markers now include validated session-path hints, with targeted standard-filename and bounded legacy discovery as fallback instead of listing all Pi session history.
+- **Overall quit-flush deadline** — Added `quitFlushTimeoutMs` (default and maximum 10000 ms) as one deadline for all retention work during quit.
+
+### Fixed
+
+- **Recoverable cancellation after submission** — Cancellation after a retention submission starts is reported as an unknown outcome and restores durable pending work for idempotent retry.
+- **Missing pending sessions remain queued** — Unresolved or temporarily unavailable session files no longer cause pending retention intent to be silently retired.
+
+### Internal
+
+- Added focused tests for configured-model generation, active and non-active session metadata persistence, pending path resolution, unknown submission outcomes, and the quit deadline.
+
 ## 0.6.0
 
 ### Features

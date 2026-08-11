@@ -2,8 +2,11 @@
  * Session parsing and upsert subcommands.
  */
 
-import type { ExtensionContext, SessionInfo } from "@earendil-works/pi-coding-agent";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import type { Dirent } from "node:fs";
+import { open, readdir } from "node:fs/promises";
+import { join } from "node:path";
+import type { ExtensionAPI, ExtensionContext, SessionInfo } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { HindsightClientWrapper } from "../client";
 import type { HindsightConfig } from "../config";
 import { parseSessionFile } from "../document";
@@ -17,6 +20,7 @@ import {
 } from "../parsed-store";
 import {
   getPendingSessionIds,
+  getPendingSessionPathHints,
   hasPendingFlag,
   recoverAllStaleInflightClaims,
   toolQueueExists,
@@ -88,13 +92,168 @@ function withSessionNotifyPrefix(ctx: ExtensionContext, prefix: string): Extensi
   }) as ExtensionContext;
 }
 
-/**
- * Build a map of session IDs to SessionInfo by listing all sessions.
- * Throws on failure — callers should handle and notify.
- */
-async function buildSessionMap(): Promise<Map<string, SessionInfo>> {
-  const allSessions = await SessionManager.listAll();
-  return new Map(allSessions.map((s) => [s.id, s]));
+interface ResolvedSessionInfo {
+  id: string;
+  path: string;
+  name?: string;
+}
+
+const STANDARD_PI_SESSION_FILENAME = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_(.+)\.jsonl$/;
+const MAX_LEGACY_SESSION_FILES = 2048;
+const MAX_SESSION_HEADER_BYTES = 64 * 1024;
+
+function throwIfCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new Error("Operation cancelled");
+  }
+}
+
+async function readSessionHeaderId(path: string, signal?: AbortSignal): Promise<string | null> {
+  throwIfCancelled(signal);
+  let file: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    file = await open(path, "r");
+    const buffer = Buffer.alloc(MAX_SESSION_HEADER_BYTES + 1);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    throwIfCancelled(signal);
+    const newline = buffer.subarray(0, bytesRead).indexOf(0x0a);
+    if (newline < 0 || newline > MAX_SESSION_HEADER_BYTES) {
+      return null;
+    }
+    const header = JSON.parse(buffer.subarray(0, newline).toString("utf8")) as unknown;
+    if (
+      typeof header !== "object" ||
+      header === null ||
+      (header as { type?: unknown }).type !== "session" ||
+      typeof (header as { id?: unknown }).id !== "string"
+    ) {
+      return null;
+    }
+    return (header as { id: string }).id;
+  } catch {
+    throwIfCancelled(signal);
+    return null;
+  } finally {
+    await file?.close();
+  }
+}
+
+async function resolvePendingSessionsFromHistory(
+  pendingIds: string[],
+  signal?: AbortSignal
+): Promise<Map<string, ResolvedSessionInfo>> {
+  const requested = new Set(pendingIds);
+  const normalCandidates = new Map<string, string[]>();
+  const legacyPaths: string[] = [];
+  const sessionsDir = join(getAgentDir(), "sessions");
+  let projectDirs: Dirent[];
+  try {
+    projectDirs = await readdir(sessionsDir, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return new Map();
+    }
+    throw error;
+  }
+
+  for (const projectDir of projectDirs) {
+    throwIfCancelled(signal);
+    if (!projectDir.isDirectory()) continue;
+    const projectPath = join(sessionsDir, projectDir.name);
+    let files: Dirent[];
+    try {
+      files = await readdir(projectPath, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      if (!file.isFile() || !file.name.endsWith(".jsonl")) continue;
+      const match = STANDARD_PI_SESSION_FILENAME.exec(file.name);
+      const filenameId = match?.[1];
+      const path = join(projectPath, file.name);
+      if (filenameId && requested.has(filenameId)) {
+        const candidates = normalCandidates.get(filenameId) ?? [];
+        candidates.push(path);
+        normalCandidates.set(filenameId, candidates);
+      } else if (!match) {
+        legacyPaths.push(path);
+      }
+    }
+  }
+
+  const resolved = new Map<string, ResolvedSessionInfo>();
+  const unresolvableIds = new Set<string>();
+  for (const id of requested) {
+    const candidates = normalCandidates.get(id) ?? [];
+    if (candidates.length > 1) {
+      unresolvableIds.add(id);
+      continue;
+    }
+    if (candidates.length === 1) {
+      const path = candidates[0];
+      if (path && (await readSessionHeaderId(path, signal)) === id) {
+        resolved.set(id, { id, path });
+      } else {
+        unresolvableIds.add(id);
+      }
+    }
+  }
+
+  if (legacyPaths.length > MAX_LEGACY_SESSION_FILES) {
+    return resolved;
+  }
+
+  for (const path of legacyPaths) {
+    const id = await readSessionHeaderId(path, signal);
+    if (!id || !requested.has(id) || unresolvableIds.has(id)) continue;
+    if (resolved.has(id)) {
+      resolved.delete(id);
+      unresolvableIds.add(id);
+    } else {
+      resolved.set(id, { id, path });
+    }
+  }
+
+  return resolved;
+}
+
+/** Resolve validated marker paths first, then discover only unresolved legacy work. */
+export async function resolvePendingSessions(
+  pendingIds: string[],
+  signal?: AbortSignal
+): Promise<Map<string, ResolvedSessionInfo>> {
+  const resolved = new Map<string, ResolvedSessionInfo>();
+  const unresolved: string[] = [];
+  for (const id of pendingIds) {
+    throwIfCancelled(signal);
+    const matchingHints: string[] = [];
+    for (const hint of getPendingSessionPathHints(id)) {
+      if ((await readSessionHeaderId(hint, signal)) === id) matchingHints.push(hint);
+    }
+    if (matchingHints.length === 1) {
+      resolved.set(id, { id, path: matchingHints[0] as string });
+    } else {
+      unresolved.push(id);
+    }
+  }
+  if (unresolved.length === 0) return resolved;
+
+  const discovered = await resolvePendingSessionsFromHistory(unresolved, signal);
+  for (const [id, session] of discovered) resolved.set(id, session);
+  return resolved;
+}
+
+async function resolveToolSessionNames(
+  sessionIds: string[],
+  signal?: AbortSignal
+): Promise<Map<string, SessionInfo>> {
+  throwIfCancelled(signal);
+  const sessions = await SessionManager.listAll();
+  throwIfCancelled(signal);
+  const requested = new Set(sessionIds);
+  return new Map(
+    sessions.filter((session) => requested.has(session.id)).map((session) => [session.id, session])
+  );
 }
 
 /**
@@ -114,7 +273,7 @@ async function buildSessionMap(): Promise<Map<string, SessionInfo>> {
  *    already returns `Untitled`/undefined respectively; `Untitled` is used.
  */
 function resolveSessionDisplayName(
-  sessionInfo: SessionInfo | undefined,
+  sessionInfo: ResolvedSessionInfo | undefined,
   config: HindsightConfig
 ): string {
   if (sessionInfo?.path) {
@@ -140,11 +299,14 @@ function resolveSessionDisplayName(
  */
 async function flushPendingSession(
   sessionId: string,
-  sessionMap: Map<string, SessionInfo>,
+  sessionMap: Map<string, ResolvedSessionInfo>,
   config: HindsightConfig,
   client: HindsightClientWrapper,
   ctx: ExtensionContext,
-  options?: { autoFlush?: boolean }
+  options?: {
+    autoFlush?: boolean;
+    appendActiveEntry?: (customType: string, data?: unknown) => void;
+  }
 ): Promise<void> {
   const sessionInfo = sessionMap.get(sessionId);
   // Derive the per-session prefix. Only pending-marker sessions need the full
@@ -178,7 +340,12 @@ async function flushPendingSession(
         client,
         prefixedCtx,
         ctx.signal,
-        { requirePending: true, autoFlush, notifySuccess }
+        {
+          requirePending: true,
+          autoFlush,
+          notifySuccess,
+          appendActiveEntry: options?.appendActiveEntry,
+        }
       );
     }
   }
@@ -202,6 +369,7 @@ async function flushPendingSession(
  * last flush. Also flushes any pending tool queue entries.
  */
 export function createFlushSubcommand(
+  pi: ExtensionAPI,
   client: HindsightClientWrapper | null,
   config: HindsightConfig
 ): Subcommand {
@@ -222,6 +390,7 @@ export function createFlushSubcommand(
 
       await flushCurrentSession(sessionId, sessionPath, config, client, ctx, ctx.signal, {
         notifyNoWork: true,
+        appendActiveEntry: (customType, data) => pi.appendEntry(customType, data),
       });
     },
   };
@@ -256,6 +425,7 @@ export async function flushAllPending(
     notifyNoWork?: boolean;
     ctxWrapper?: (ctx: ExtensionContext) => ExtensionContext;
     autoFlush?: boolean;
+    appendActiveEntry?: (customType: string, data?: unknown) => void;
   }
 ): Promise<void> {
   const flushCtx = options?.ctxWrapper ? options.ctxWrapper(ctx) : ctx;
@@ -306,15 +476,23 @@ export async function flushAllPending(
     }
   }
 
-  // Build session map via SessionManager.listAll(). This is expected to be reliable
-  // in normal pi operation, and pending session upserts require it to resolve IDs
-  // to session files; abort the flush if session discovery itself fails.
-  let sessionMap: Map<string, SessionInfo>;
+  // Session files are needed only for pending-marker reparses. Tool-queue-only
+  // recovery deliberately avoids touching the session store.
+  let sessionMap = new Map<string, ResolvedSessionInfo>();
   try {
-    sessionMap = await buildSessionMap();
+    if (sessionsWithPending.length > 0) {
+      sessionMap = await resolvePendingSessions(sessionsWithPending, flushCtx.signal);
+    }
+    // Manual flush preserves explicit SessionInfo names in tool-only notification
+    // prefixes. Startup and quit recovery never pay for this cosmetic lookup.
+    if (confirm) {
+      const toolOnlyIds = sessionsWithToolQueue.filter((id) => !hasPendingFlag(id));
+      const toolSessions = await resolveToolSessionNames(toolOnlyIds, flushCtx.signal);
+      for (const [id, session] of toolSessions) sessionMap.set(id, session);
+    }
   } catch (e) {
     flushCtx.ui.notify(
-      `Failed to list sessions: ${e instanceof Error ? e.message : String(e)}`,
+      `Failed to resolve pending sessions: ${e instanceof Error ? e.message : String(e)}`,
       "error"
     );
     return;
@@ -327,7 +505,11 @@ export async function flushAllPending(
   }
 
   for (const sessionId of allSessionIds) {
-    await flushPendingSession(sessionId, sessionMap, config, client, flushCtx, { autoFlush });
+    if (flushCtx.signal?.aborted) break;
+    await flushPendingSession(sessionId, sessionMap, config, client, flushCtx, {
+      autoFlush,
+      appendActiveEntry: options?.appendActiveEntry,
+    });
   }
 }
 
@@ -340,6 +522,7 @@ export async function flushAllPending(
  * Tool-only sessions (no pending markers) are included.
  */
 export function createFlushPendingSubcommand(
+  pi: ExtensionAPI,
   client: HindsightClientWrapper | null,
   config: HindsightConfig
 ): Subcommand {
@@ -351,7 +534,11 @@ export function createFlushPendingSubcommand(
         return;
       }
 
-      await flushAllPending(config, client, ctx, { confirm: true, notifyNoWork: true });
+      await flushAllPending(config, client, ctx, {
+        confirm: true,
+        notifyNoWork: true,
+        appendActiveEntry: (customType, data) => pi.appendEntry(customType, data),
+      });
     },
   };
 }
@@ -403,6 +590,7 @@ export function createParseSessionSubcommand(config: HindsightConfig): Subcomman
  * and retention in one step.
  */
 export function createParseAndUpsertSessionSubcommand(
+  pi: ExtensionAPI,
   client: HindsightClientWrapper | null,
   config: HindsightConfig
 ): Subcommand {
@@ -424,6 +612,7 @@ export function createParseAndUpsertSessionSubcommand(
 
       await parseAndUpsertSession(sessionPath, sessionId, config, client, ctx, ctx.signal, {
         requirePending: false,
+        appendActiveEntry: (customType, data) => pi.appendEntry(customType, data),
       });
     },
   };
