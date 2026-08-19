@@ -16,6 +16,7 @@
 
 ### Internal
 
+- Documented dependency installation before full CI validation in fresh clones and Git worktrees.
 - Added focused tests for configured-model generation, active and non-active session metadata persistence, pending path resolution, unknown submission outcomes, and the quit deadline.
 
 ## 0.6.0

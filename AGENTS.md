@@ -17,4 +17,4 @@
 - **No simulation tests**: Do not reimplement production logic in tests (e.g., copying filtering/transform logic into a test helper). This gives false confidence — the test passes even if the real code breaks. Instead, exercise the real handlers via integration tests (invoke handlers from `createMockPi()`, call `parseAndUpsertSession()`, etc.). See `tests/bootstrap.test.ts` for the pattern.
 - **Test behavior, not implementation**: Test descriptions and assertions should describe observable behavior (e.g. "recall works on first message") not implementation details (e.g. "uses event.prompt").
 - **Never modify the user's actual pi agent directory in tests**: Use `setupTempAgentDir()` from `fixtures.ts`. Use `makeCtx()` with an explicit session ID so queue/file operations target the test session.
-- **Run `bun run ci` after completing tasks**
+- **In each fresh worktree, run `bun install --frozen-lockfile` before `bun run ci`; run the full CI after completing tasks**

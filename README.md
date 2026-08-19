@@ -27,6 +27,7 @@ If you want to skip ahead and just try it without background information, see [Q
 - [Configuration](#configuration)
   - [Example Configuration](#example-configuration)
 - [Project-local Settings](#project-local-settings)
+- [Development](#development)
 - [Recommended User Best Practices](#recommended-user-best-practices)
 - [Caveats](#caveats)
 - [FAQ](#faq)
@@ -223,6 +224,14 @@ Configuration is stored in `<getAgentDir()>/epimetheus/config.json` or `config.j
 Project-local settings live under a project cwd instead of the global epimetheus config. Currently, the only supported project-local setting is a `projectName` override used for project-scoped flushing and auto-recall. See [Project-local Settings](docs/reference.md#project-local-settings) for more details.
 
 If you need other project-local settings, please open an issue describing the setting and why it needs to vary by project.
+
+# Development
+In each fresh clone or Git worktree, install the locked dependencies before running the full validation suite:
+
+```bash
+bun install --frozen-lockfile
+bun run ci
+```
 
 # Recommended User Best Practices
 ## Initially
