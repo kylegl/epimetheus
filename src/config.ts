@@ -124,6 +124,8 @@ export interface HindsightConfig {
   autoRecallPersist: boolean;
   autoRecallRole: AutoRecallRole;
   recallMaxQueryChars: number;
+  /** Deadline for Hindsight recall requests in milliseconds. */
+  recallTimeoutMs: number;
   autoRecallTypes: MemoryType[] | null;
   autoRecallTags: string[] | null;
   autoRecallTagsMatch: TagsMatch;
@@ -184,6 +186,7 @@ const DEFAULT_CONFIG: HindsightConfig = {
   autoRecallPersist: false,
   autoRecallRole: "user",
   recallMaxQueryChars: 800,
+  recallTimeoutMs: 10000,
   autoRecallTypes: ["observation"],
   autoRecallTags: null,
   autoRecallTagsMatch: "any",
@@ -245,6 +248,7 @@ const VALID_CONFIG_KEYS = new Set<keyof HindsightConfig>([
   "autoRecallPersist",
   "autoRecallRole",
   "recallMaxQueryChars",
+  "recallTimeoutMs",
   "autoRecallTypes",
   "autoRecallTags",
   "autoRecallTagsMatch",
@@ -626,6 +630,7 @@ function setConfigValue(
     }
     case "hindsightContextMaxLength":
     case "recallMaxQueryChars":
+    case "recallTimeoutMs":
     case "quitFlushTimeoutMs": {
       if (typeof value === "number" && Number.isFinite(value)) {
         config[key] = value;
@@ -1247,6 +1252,11 @@ export function loadConfig(extensionsDir?: string): {
       legacy: ["PI_HINDSIGHT_RECALL_MAX_QUERY_CHARS"],
     },
     {
+      configKey: "recallTimeoutMs",
+      preferred: "EPIMETHEUS_RECALL_TIMEOUT_MS",
+      legacy: ["PI_HINDSIGHT_RECALL_TIMEOUT_MS"],
+    },
+    {
       configKey: "autoRecallTypes",
       preferred: "EPIMETHEUS_AUTO_RECALL_TYPES",
       legacy: ["PI_HINDSIGHT_AUTO_RECALL_TYPES", "PI_HINDSIGHT_RECALL_TYPES"],
@@ -1486,6 +1496,18 @@ export function validateConfig(config: HindsightConfig): {
       `recallMaxQueryChars must be >= 1. Using default: ${DEFAULT_CONFIG.recallMaxQueryChars}.`
     );
     config.recallMaxQueryChars = DEFAULT_CONFIG.recallMaxQueryChars;
+  }
+
+  // Validate recallTimeoutMs - reset to the historical default if invalid.
+  if (
+    typeof config.recallTimeoutMs !== "number" ||
+    !Number.isInteger(config.recallTimeoutMs) ||
+    config.recallTimeoutMs < 1
+  ) {
+    warnings.push(
+      `recallTimeoutMs must be an integer >= 1. Using default: ${DEFAULT_CONFIG.recallTimeoutMs}.`
+    );
+    config.recallTimeoutMs = DEFAULT_CONFIG.recallTimeoutMs;
   }
 
   // Valid content types per retainContent role
