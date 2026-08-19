@@ -244,7 +244,7 @@ export class HindsightClientWrapper {
   async recall(
     options: RecallOptions,
     signal?: AbortSignal,
-    timeoutMs: number = 10000
+    timeoutMs: number = this.config.recallTimeoutMs
   ): Promise<{ success: boolean; response?: RecallResponse; error?: string }> {
     try {
       const result = await this.withTimeout(
