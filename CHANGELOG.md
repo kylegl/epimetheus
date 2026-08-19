@@ -1,6 +1,20 @@
 # Changelog
 
-## Pending
+## 0.6.1
+
+### Fixed
+
+- **Hindsight tools missing after `/new`, `/resume`, `/fork`, or `/reload`** — after these session transitions, Hindsight tools were not re-registered for the new runtime, so the fresh session had no `hindsight_*` tools available even though `/hindsight status` still reported healthy. Each such transition now starts from a clean state and re-registers its tools, so the new runtime always has them available.
+- **Foreign tools sharing the `hindsight_` prefix are preserved** — `refreshToolVisibility` previously hid every active tool whose name started with `hindsight_`, which could remove a foreign extension's tool merely sharing the prefix. Visibility filtering now reserves only epimetheus's exact canonical tool names and preserves all other active tools in operational and degraded transitions. Extensions that register the same canonical names are incompatible.
+
+### Internal
+
+- **`/hindsight active-tools` readiness source** — The report now uses the same `isReady()` getter as the slash-command dispatcher instead of the global `isOperationalReady()`, so it cannot disagree with operational-command gating in fail-fast/invalid-config paths.
+- **`/hindsight active-tools` toolsEnabled intentional-none note** — When `toolsEnabled` is `false` or an empty array (both intentionally register no tools), the report now shows a clear "all Hindsight tools are disabled by toolsEnabled" note instead of suggesting server/config repair for an intentional disable.
+- **File-backed debug log** — All epimetheus console output (`debugLog`/`debugWarn`/`debugError`) is now mirrored to `~/.pi/agent/epimetheus/debug.log` (timestamped, leveled) so it can be `tail -f`'d, since pi's interactive TUI swallows extension console output. Console behavior is unchanged; synchronous file writes are best-effort and never throw. Warnings/errors always persist; verbose info is caller-gated by `config.debug`. The log rotates at 5 MiB with two backups, individual entries are capped at 64 KiB, and malformed-session warnings are aggregated per parse.
+- **Session-start phase diagnostics** — With `debug: true`, Epimetheus now logs the precise `session_start` phase and stack trace when setup throws, making failures that prevent lazy tool registration diagnosable.
+- **Client-free tool diagnostics** — When no Hindsight client is available, locally registered extra-context and retain tools are now recorded consistently for visibility restoration and diagnostics.
+- **`/hindsight active-tools` diagnostics** — The debug-only `active-tools` subcommand now also reports registered tools via `pi.getAllTools()` and classifies every Hindsight tool as registered-and-active, registered-but-inactive (degraded-mode hiding or narrowed active-tool selection), or not-registered-at-all (config disabled it, lazy registration has not run, or Pi excluded it before building `getAllTools()`). It cross-references the extension's own registered-tool record with what Pi reports and includes each registered tool's `sourceInfo`, so Pi-level exclusion or lazy-registration issues are easy to spot.
 
 ### Features
 

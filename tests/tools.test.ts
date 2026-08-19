@@ -12,6 +12,7 @@ import type { HindsightClientWrapper } from "../src/client";
 import type { HindsightConfig } from "../src/config";
 import { clearSessionQueueState, removePendingFlag } from "../src/queue";
 import {
+  getRegisteredHindsightTools,
   markStartupReady,
   resetActiveSessionProjectReady,
   resetRegisteredHindsightTools,
@@ -168,6 +169,16 @@ describe("registerTools", () => {
     registerTools(pi, testConfig, null);
     expect(pi.tools.some((t: ToolDef) => t.name === "hindsight_recall")).toBe(false);
     expect(pi.tools.some((t: ToolDef) => t.name === "hindsight_reflect")).toBe(false);
+  });
+
+  it("records client-free tools in runtime state when client is null", () => {
+    const pi = createMockPi();
+    registerTools(pi, testConfig, null);
+    expect(getRegisteredHindsightTools()).toEqual([
+      "hindsight_set_extra_context",
+      "hindsight_get_extra_context",
+      "hindsight_retain",
+    ]);
   });
 
   it("registers only listed tools when toolsEnabled is an array", () => {
@@ -950,6 +961,40 @@ describe("refreshToolVisibility", () => {
     refreshToolVisibility(pi, true);
     expect(pi.getActiveTools()).toContain("other_tool");
     expect(pi.getActiveTools()).not.toContain("hindsight_retain");
+  });
+
+  it("preserves a foreign active tool outside the reserved canonical names", () => {
+    const pi = createMockPi();
+    // A foreign extension tool whose name merely shares the `hindsight_`
+    // prefix. It is outside epimetheus's reserved canonical names, so it must
+    // be preserved across every refresh — both in
+    // operational and degraded transitions.
+    (pi as unknown as { registerTool: (t: unknown) => void }).registerTool({
+      name: "hindsight_foreign",
+      execute: () => ({}),
+      parameters: {},
+    });
+    registerTools(pi, testConfig, createMockClient());
+    beOperational();
+
+    // Operational + retained: owned tools shown, foreign prefixed tool kept.
+    refreshToolVisibility(pi, true);
+    expect(pi.getActiveTools()).toContain("hindsight_foreign");
+    expect(pi.getActiveTools()).toContain("hindsight_recall");
+
+    // Operational + not retained: only retain hidden; foreign tool still kept.
+    refreshToolVisibility(pi, false);
+    expect(pi.getActiveTools()).toContain("hindsight_foreign");
+    expect(pi.getActiveTools()).not.toContain("hindsight_retain");
+
+    // Degraded: ALL owned hindsight tools hidden, but the foreign prefixed
+    // tool (not an epimetheus-registered name) is preserved.
+    setActiveSessionProjectReady(false);
+    refreshToolVisibility(pi, true);
+    const active = pi.getActiveTools();
+    expect(active).toContain("hindsight_foreign");
+    expect(active).not.toContain("hindsight_recall");
+    expect(active).not.toContain("hindsight_retain");
   });
 });
 

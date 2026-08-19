@@ -64,10 +64,18 @@ interface RegisteredCmd {
 describe("registerCommands", () => {
   let registeredCommands: Map<string, RegisteredCmd>;
   let mockActiveTools: string[];
+  type MockToolInfo = {
+    name: string;
+    description: string;
+    parameters: unknown;
+    sourceInfo: { path: string; source: string; scope: string; origin: string; baseDir?: string };
+  };
+  let mockAllTools: MockToolInfo[];
   let mockPi: {
     registerCommand: ReturnType<typeof mock>;
     appendEntry: ReturnType<typeof mock>;
     getActiveTools: ReturnType<typeof mock>;
+    getAllTools: ReturnType<typeof mock>;
     setActiveTools: ReturnType<typeof mock>;
   };
   let mockClient: HindsightClientWrapper | null;
@@ -102,6 +110,54 @@ describe("registerCommands", () => {
       "hindsight_recall",
       "hindsight_reflect",
     ];
+    // By default, pretend all five Hindsight tools plus the built-ins are
+    // registered in Pi. Tests can overwrite `mockAllTools` to simulate
+    // not-registered / lazy-registration scenarios.
+    const sourceInfo = (name: string) => ({
+      path: `<extension>:${name}`,
+      source: "extension",
+      scope: "project",
+      origin: "top-level",
+    });
+    mockAllTools = [
+      { name: "read", description: "read", parameters: {}, sourceInfo: sourceInfo("read") },
+      { name: "bash", description: "bash", parameters: {}, sourceInfo: sourceInfo("bash") },
+      { name: "edit", description: "edit", parameters: {}, sourceInfo: sourceInfo("edit") },
+      { name: "write", description: "write", parameters: {}, sourceInfo: sourceInfo("write") },
+      { name: "grep", description: "grep", parameters: {}, sourceInfo: sourceInfo("grep") },
+      { name: "find", description: "find", parameters: {}, sourceInfo: sourceInfo("find") },
+      { name: "ls", description: "ls", parameters: {}, sourceInfo: sourceInfo("ls") },
+      {
+        name: "hindsight_retain",
+        description: "retain",
+        parameters: {},
+        sourceInfo: sourceInfo("hindsight_retain"),
+      },
+      {
+        name: "hindsight_recall",
+        description: "recall",
+        parameters: {},
+        sourceInfo: sourceInfo("hindsight_recall"),
+      },
+      {
+        name: "hindsight_reflect",
+        description: "reflect",
+        parameters: {},
+        sourceInfo: sourceInfo("hindsight_reflect"),
+      },
+      {
+        name: "hindsight_set_extra_context",
+        description: "set",
+        parameters: {},
+        sourceInfo: sourceInfo("hindsight_set_extra_context"),
+      },
+      {
+        name: "hindsight_get_extra_context",
+        description: "get",
+        parameters: {},
+        sourceInfo: sourceInfo("hindsight_get_extra_context"),
+      },
+    ];
 
     mockPi = {
       registerCommand: mock((name: string, options: RegisteredCmd) => {
@@ -111,6 +167,7 @@ describe("registerCommands", () => {
         appendedEntries.push({ customType, data });
       }),
       getActiveTools: mock(() => [...mockActiveTools]),
+      getAllTools: mock(() => [...mockAllTools]),
       setActiveTools: mock((names: string[]) => {
         mockActiveTools.length = 0;
         mockActiveTools.push(...names);
@@ -2202,6 +2259,205 @@ describe("registerCommands", () => {
       register({ ...statusTestConfig, autoRecallPersist: true, autoRecallDisplay: false });
       await getHandler()("toggle-display", makeCtx());
       expect(lastNotification?.message).toContain("Recall display: hidden");
+    });
+  });
+
+  describe("active-tools subcommand (debug-only)", () => {
+    it("is only registered in debug mode", async () => {
+      register({ ...statusTestConfig, debug: false });
+      await getHandler()("active-tools", makeCtx());
+      expect(lastNotification?.message).toContain("Unknown subcommand: active-tools");
+    });
+
+    it("reports active/registered/per-tool state for the healthy case", async () => {
+      markStartupReady();
+      register({ ...statusTestConfig, debug: true });
+      setRegisteredHindsightTools([
+        "hindsight_retain",
+        "hindsight_recall",
+        "hindsight_reflect",
+        "hindsight_set_extra_context",
+        "hindsight_get_extra_context",
+      ]);
+      // Make all five hindsight tools active so every per-tool line is "active".
+      mockActiveTools = [
+        "read",
+        "bash",
+        "edit",
+        "write",
+        "grep",
+        "find",
+        "ls",
+        "hindsight_retain",
+        "hindsight_recall",
+        "hindsight_reflect",
+        "hindsight_set_extra_context",
+        "hindsight_get_extra_context",
+      ];
+      await getHandler()("active-tools", makeCtx());
+      const msg = lastNotification!.message;
+      // Keeps the original active-tools summary.
+      expect(msg).toContain("Active tools (12):");
+      expect(msg).toContain(
+        "hindsight: [hindsight_retain, hindsight_recall, hindsight_reflect, hindsight_set_extra_context, hindsight_get_extra_context]"
+      );
+      // Shows registration breakdown.
+      expect(msg).toContain("== Hindsight Tool Registration ==");
+      expect(msg).toContain("Operational ready:        yes");
+      expect(msg).toContain("of which hindsight: [hindsight_retain");
+      // All five hindsight tools are registered-and-active.
+      expect(msg).toContain(
+        "✓ active:           hindsight_recall  [extension, top-level, project]"
+      );
+      expect(msg).toContain(
+        "✓ active:           hindsight_get_extra_context  [extension, top-level, project]"
+      );
+      expect(msg).not.toContain("✗ not registered:");
+      expect(msg).not.toContain("✗ inactive:");
+      // Healthy case produces no notes section.
+      expect(msg).not.toContain("== Notes ==");
+    });
+
+    it("reports registered-but-inactive tools when degraded hides them", async () => {
+      // startupReady stays false (reset in afterEach) so isOperationalReady()
+      // is false, matching degraded-mode tool hiding.
+      registerWithReady({ ...statusTestConfig, debug: true }, mockClient, () => false);
+      setRegisteredHindsightTools(["hindsight_retain", "hindsight_recall"]);
+      // Simulate degraded mode hiding all hindsight tools from the active set.
+      mockActiveTools = mockActiveTools.filter((n) => !n.startsWith("hindsight_"));
+      await getHandler()("active-tools", makeCtx());
+      const msg = lastNotification!.message;
+      expect(msg).toContain("Operational ready:        no");
+      expect(msg).toContain(
+        "✗ inactive:         hindsight_retain  (registered in Pi but hidden — extension is in degraded mode)"
+      );
+    });
+
+    it("attributes an operational inactive tool to active-tool selection", async () => {
+      markStartupReady();
+      register({ ...statusTestConfig, debug: true });
+      setRegisteredHindsightTools(["hindsight_recall"]);
+      mockActiveTools = mockActiveTools.filter((n) => n !== "hindsight_recall");
+      await getHandler()("active-tools", makeCtx());
+      const msg = lastNotification!.message;
+      expect(msg).toContain(
+        "✗ inactive:         hindsight_recall  (registered in Pi but NOT active — active-tool selection or visibility was narrowed)"
+      );
+      expect(msg).not.toContain("inactive — Pi allowlist/exclusion");
+    });
+
+    it("reports not-registered-at-all and surfaces lazy-registration hint when operational", async () => {
+      markStartupReady();
+      register({ ...statusTestConfig, debug: true });
+      // Extension has not registered any tools yet, and Pi reports none either.
+      setRegisteredHindsightTools([]);
+      mockAllTools = mockAllTools.filter((t) => !t.name.startsWith("hindsight_"));
+      mockActiveTools = mockActiveTools.filter((n) => !n.startsWith("hindsight_"));
+      await getHandler()("active-tools", makeCtx());
+      const msg = lastNotification!.message;
+      expect(msg).toContain("✗ not registered:   hindsight_retain");
+      expect(msg).toContain("✗ not registered:   hindsight_recall");
+      expect(msg).toContain("of which hindsight: [none]");
+      expect(msg).toContain("== Notes ==");
+      expect(msg).toContain(
+        "No hindsight_* tools are registered in Pi even though the extension appears operational"
+      );
+    });
+
+    it("flags the runtime-state/Pi mismatch as a possible Pi allowlist exclusion", async () => {
+      markStartupReady();
+      register({ ...statusTestConfig, debug: true });
+      // Extension thinks it registered retain+recall, but Pi exposes neither.
+      setRegisteredHindsightTools(["hindsight_retain", "hindsight_recall"]);
+      mockAllTools = mockAllTools.filter(
+        (t) => t.name !== "hindsight_retain" && t.name !== "hindsight_recall"
+      );
+      mockActiveTools = mockActiveTools.filter(
+        (n) => n !== "hindsight_retain" && n !== "hindsight_recall"
+      );
+      await getHandler()("active-tools", makeCtx());
+      const msg = lastNotification!.message;
+      expect(msg).toContain(
+        "✗ not registered:   hindsight_retain (runtime-state claims it was registered — Pi-level registration did not stick)"
+      );
+      expect(msg).toContain("== Notes ==");
+      expect(msg).toContain("A Pi-level allowlist/exclusion may be removing them");
+    });
+
+    it("reflects toolsEnabled when set to a subset", async () => {
+      markStartupReady();
+      register({ ...statusTestConfig, debug: true, toolsEnabled: ["retain", "recall"] });
+      setRegisteredHindsightTools(["hindsight_retain", "hindsight_recall"]);
+      mockAllTools = mockAllTools.filter(
+        (t) =>
+          t.name === "hindsight_retain" ||
+          t.name === "hindsight_recall" ||
+          !t.name.startsWith("hindsight_")
+      );
+      await getHandler()("active-tools", makeCtx());
+      const msg = lastNotification!.message;
+      expect(msg).toContain(
+        "Configured (toolsEnabled): [retain, recall] → [hindsight_retain, hindsight_recall]"
+      );
+    });
+
+    it("shows the disabled-by-config note instead of the lazy-registration hint when toolsEnabled is false", async () => {
+      markStartupReady();
+      register({ ...statusTestConfig, debug: true, toolsEnabled: false });
+      setRegisteredHindsightTools([]);
+      mockAllTools = mockAllTools.filter((t) => !t.name.startsWith("hindsight_"));
+      mockActiveTools = mockActiveTools.filter((n) => !n.startsWith("hindsight_"));
+      await getHandler()("active-tools", makeCtx());
+      const msg = lastNotification!.message;
+      expect(msg).toContain("Configured (toolsEnabled): none → [none]");
+      expect(msg).toContain("of which hindsight: [none]");
+      expect(msg).toContain("== Notes ==");
+      expect(msg).toContain(
+        "All Hindsight tools are disabled by toolsEnabled (set to false or an " +
+          "empty array). No hindsight_* tools are registered or active by design."
+      );
+      // Must NOT suggest server/config repair for an intentional disable.
+      expect(msg).not.toContain(
+        "No hindsight_* tools are registered in Pi even though the extension appears operational"
+      );
+    });
+
+    it("shows the intentional-none note for an empty toolsEnabled array", async () => {
+      markStartupReady();
+      register({ ...statusTestConfig, debug: true, toolsEnabled: [] });
+      setRegisteredHindsightTools([]);
+      mockAllTools = mockAllTools.filter((t) => !t.name.startsWith("hindsight_"));
+      mockActiveTools = mockActiveTools.filter((n) => !n.startsWith("hindsight_"));
+      await getHandler()("active-tools", makeCtx());
+      const msg = lastNotification!.message;
+      expect(msg).toContain("Configured (toolsEnabled): [] → [none]");
+      expect(msg).toContain("of which hindsight: [none]");
+      expect(msg).toContain("== Notes ==");
+      expect(msg).toContain(
+        "All Hindsight tools are disabled by toolsEnabled (set to false or an " +
+          "empty array). No hindsight_* tools are registered or active by design."
+      );
+      // Must NOT suggest server/config repair for an intentional disable.
+      expect(msg).not.toContain(
+        "No hindsight_* tools are registered in Pi even though the extension appears operational"
+      );
+    });
+
+    it("uses the dispatcher isReady() rather than the global isOperationalReady()", async () => {
+      // Simulate the fail-fast invalid-global-config path: the dispatcher's
+      // isReady() is a constant false, even though the global readiness latch
+      // (markStartupReady) happens to be true. The report must reflect isReady()
+      // so it cannot disagree with operational-command gating.
+      markStartupReady();
+      registerWithReady({ ...statusTestConfig, debug: true }, mockClient, () => false);
+      setRegisteredHindsightTools(["hindsight_retain"]);
+      mockActiveTools = mockActiveTools.filter((n) => !n.startsWith("hindsight_"));
+      await getHandler()("active-tools", makeCtx());
+      const msg = lastNotification!.message;
+      expect(msg).toContain("Operational ready:        no");
+      expect(msg).toContain(
+        "✗ inactive:         hindsight_retain  (registered in Pi but hidden — extension is in degraded mode)"
+      );
     });
   });
 

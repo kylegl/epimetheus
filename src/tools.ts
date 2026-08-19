@@ -335,8 +335,12 @@ export function registerTools(
     });
   }
 
-  // recall and reflect require client
-  if (!client) return registered;
+  // recall and reflect require client. Record client-free tools before
+  // returning so visibility restoration and diagnostics reflect what Pi has.
+  if (!client) {
+    setRegisteredHindsightTools(registered);
+    return registered;
+  }
 
   // Register hindsight_recall if enabled
   if (isToolEnabled(config, "recall")) {
@@ -483,13 +487,35 @@ export function registerTools(
 }
 
 /**
+ * The canonical tool-name namespace reserved by epimetheus. Visibility uses
+ * exact names rather than the `hindsight_` prefix, so a foreign tool that only
+ * shares the prefix (e.g. `hindsight_foreign`) is preserved. Extensions that
+ * register one of these exact canonical names are incompatible with epimetheus.
+ */
+const HINDSIGHT_OWNED_TOOLS = new Set([
+  "hindsight_set_extra_context",
+  "hindsight_get_extra_context",
+  "hindsight_retain",
+  "hindsight_recall",
+  "hindsight_reflect",
+]);
+
+/**
  * Refresh the visibility of all registered Hindsight tools based on the
  * unified operational state and the session's retention flag.
  *
- * - Degraded (`!isOperationalReady()`): hide ALL hindsight tools so the LLM
- *   never sees any of them (no recall/reflect/retain/extra-context). This is
- *   the single degraded mode regardless of cause (unreachable/incompatible
- *   server, or required-but-missing/invalid cwd-local project config).
+ * Ownership is by EXACT canonical epimetheus tool name (see
+ * {@link HINDSIGHT_OWNED_TOOLS}), not by the `hindsight_` prefix. Every
+ * currently-active tool outside that reserved namespace is preserved unchanged
+ * — even one that merely shares the prefix (e.g. `hindsight_foreign`). An
+ * extension that registers one of epimetheus's exact canonical names is
+ * incompatible and may have that tool hidden by this visibility manager.
+ *
+ * - Degraded (`!isOperationalReady()`): hide all OWNED hindsight tools so the
+ *   LLM never sees any of them (no recall/reflect/retain/extra-context). This
+ *   is the single degraded mode regardless of cause (unreachable/incompatible
+ *   server, or required-but-missing/invalid cwd-local project config). Non-owned
+ *   tools are preserved.
  * - Operational: show all registered hindsight tools, except `hindsight_retain`
  *   is hidden when the session is not retained (so the LLM never sees a tool
  *   whose calls would fail). `retained` has no effect on the other tools.
@@ -497,17 +523,24 @@ export function registerTools(
  * Reads `isOperationalReady()` and the registered-tool list from
  * `runtime-state`, so callers only need to pass the session's `retained` flag.
  *
+ * Note: in operational mode, registered hindsight tools are always re-added
+ * (subject to the retained gate), even if one was deactivated outside this
+ * extension (e.g. a Pi tool allowlist/exclusion). This deliberately keeps the
+ * current intended operational/retention semantics; no speculative per-tool
+ * deactivation recovery is attempted here.
+ *
  * Enabling/disabling tools is the only place degraded mode is enforced — there
  * are no operational-state checks inside tool execute handlers.
  */
 export function refreshToolVisibility(pi: ExtensionAPI, retained: boolean): void {
   const activeNames = pi.getActiveTools();
-  // Preserve non-hindsight tools (other extensions / built-ins) unchanged.
-  const nonHindsight = activeNames.filter((n) => !n.startsWith("hindsight_"));
+  // Preserve currently-active tools outside epimetheus's reserved canonical
+  // names. A foreign tool merely sharing the `hindsight_` prefix is kept.
+  const nonOwned = activeNames.filter((n) => !HINDSIGHT_OWNED_TOOLS.has(n));
 
   if (!isOperationalReady()) {
-    // Degraded: hide all hindsight tools.
-    pi.setActiveTools(nonHindsight);
+    // Degraded: hide all owned hindsight tools; keep non-owned tools.
+    pi.setActiveTools(nonOwned);
     return;
   }
 
@@ -516,5 +549,5 @@ export function refreshToolVisibility(pi: ExtensionAPI, retained: boolean): void
   const toShow = getRegisteredHindsightTools().filter(
     (name) => name !== "hindsight_retain" || retained
   );
-  pi.setActiveTools([...nonHindsight, ...toShow]);
+  pi.setActiveTools([...nonOwned, ...toShow]);
 }

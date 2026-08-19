@@ -24,6 +24,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { HindsightConfig } from "./config";
 import { prefixLog } from "./constants";
 import { getDataDir } from "./data-dir";
+import { debugLog } from "./debug-log";
 import {
   buildContextFromSessionName,
   buildMessageArrayFromParsedSession,
@@ -243,7 +244,7 @@ export function parseCurrentSession(
 
     if (debug) {
       const elapsed = performance.now() - t0;
-      console.log(
+      debugLog(
         prefixLog(
           `debug: parseCurrentSession(${sessionId}) took ${elapsed.toFixed(2)}ms, ${result.messageCount} messages`
         )

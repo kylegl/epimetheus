@@ -23,6 +23,7 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import type { HindsightConfig } from "./config";
+import { debugWarn } from "./debug-log";
 import { ensureParsedSessionDir, getMetaPath } from "./parsed-store";
 import { touchPendingFlag } from "./queue";
 import {
@@ -323,6 +324,7 @@ function updateMetadataStateAndQueue(
   const needsExtraContextUpdate = updates.extraContext !== undefined;
 
   if (needsRetainedUpdate || needsExtraContextUpdate) {
+    // Build merged state: preserve existing values, apply updates.
     const retained = needsRetainedUpdate
       ? (updates.retained as boolean)
       : (currentState?.retained ??
@@ -339,17 +341,19 @@ function updateMetadataStateAndQueue(
     };
     const success = writeSessionState(sessionId, newState);
     if (!success) {
-      console.warn(`Failed to update live session state for ${sessionId}, removing stale state`);
+      // If state update fails, remove stale state so the next flush reparses.
+      debugWarn(`Failed to update live session state for ${sessionId}, removing stale state`);
       if (!removeSessionState(sessionId)) {
-        console.warn(`Failed to remove stale session state for ${sessionId}`);
+        debugWarn(`Failed to remove stale session state for ${sessionId}`);
       }
     }
   }
 
+  // Tags and context affect retained output, so queue a targeted re-flush.
   if (markPending && (updates.tags !== undefined || updates.extraContext !== undefined)) {
     const result = touchPendingFlag(sessionId, "metadata-update", sessionPath);
     if (!result.success) {
-      console.warn(`Failed to queue session for re-flush: ${result.error}`);
+      debugWarn(`Failed to queue session for re-flush: ${result.error}`);
     }
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "@noctuid/epimetheus",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Pi extension integrating Hindsight AI memory with the pi coding agent",
   "author": "noctuid",
   "license": "GPL-3.0",

@@ -139,7 +139,7 @@ export interface HindsightConfig {
   requireExtraContextBeforeFlush: boolean;
   /** Generate per-session extra context once before the first flush where it is still unset. */
   extraContextGeneration?: ExtraContextGenerationConfig | null;
-  /** When true, enable debug logging: active tool visibility checks, parse timing, etc. Default: false. */
+  /** When true, enable verbose diagnostics such as parse timing and active-tools reporting. Default: false. */
   debug: boolean;
   entities: EntityInput[];
   observationScopes: ObservationScopes;

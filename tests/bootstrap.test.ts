@@ -195,6 +195,44 @@ describe("real entrypoint bootstrap", () => {
     expect(toolNames).toContain("hindsight_reflect");
   });
 
+  it("logs the session-start phase when metadata initialization prevents tool registration", async () => {
+    activeConfig = { ...testConfig, debug: true };
+    const pi = createMockPi();
+    const failingPi = pi as unknown as {
+      appendEntry: (customType: string, data?: unknown) => void;
+    };
+    failingPi.appendEntry = mock(() => {
+      throw new Error("metadata write failed");
+    });
+    const ctx = createMockContext();
+    const sessionManager = ctx.sessionManager as unknown as {
+      getEntries: () => Array<{ type: string }>;
+    };
+    sessionManager.getEntries = mock(() => []);
+
+    const errorCalls: string[] = [];
+    const originalError = console.error;
+    console.error = (message: unknown) => {
+      errorCalls.push(String(message));
+    };
+
+    try {
+      const extension = await import("../src/index");
+      extension.default(pi);
+
+      await expect(
+        pi.handlers.get("session_start")!({ type: "session_start" }, ctx)
+      ).rejects.toThrow("metadata write failed");
+      expect(errorCalls).toContainEqual(
+        expect.stringContaining("session_start failed during writing session metadata")
+      );
+      expect(errorCalls).toContainEqual(expect.stringContaining("metadata write failed"));
+      expect(pi.tools).toHaveLength(0);
+    } finally {
+      console.error = originalError;
+    }
+  });
+
   it("registers /hindsight command", async () => {
     const pi = createMockPi();
     const extension = await import("../src/index");
@@ -5254,6 +5292,110 @@ describe("real entrypoint bootstrap", () => {
     // Session is retained by default in createMockContext → retain visible too.
     expect(activeAfterRecovery).toContain("hindsight_retain");
     expect(activeAfterRecovery).toContain("hindsight_recall");
+  });
+
+  it("session_shutdown(reload) re-registers tools on a rebuilt runner", async () => {
+    // In real Pi, `/reload` rebuilds the ExtensionRunner + tool registry and
+    // re-runs the extension factory (`default(pi)`) with a FRESH ExtensionAPI.
+    // Because `toolsRegistered` and `startupReadyPromise` are scoped to each
+    // factory invocation (and the runtime-state record is reset on factory
+    // entry), the fresh instance starts clean and re-registers automatically.
+    // This same-instance test simulates the same-instance (reused `pi`) reload
+    // path, where the defensive session_shutdown(reload) reset clears the
+    // factory-local idempotency latch and the runtime-state registered record
+    // so the next session_start re-registers rather than leaving the rebuilt
+    // registry without hindsight tools.
+    const { getRegisteredHindsightTools } =
+      require("../src/runtime-state") as typeof import("../src/runtime-state");
+    const pi = createMockPi();
+    const extension = await import("../src/index");
+    extension.default(pi);
+
+    // First healthy session_start registers tools against this runner.
+    await runHealthySessionStart(pi);
+    expect(pi.tools.length).toBeGreaterThan(0);
+    expect(getRegisteredHindsightTools().length).toBeGreaterThan(0);
+    const firstToolCount = pi.tools.length;
+
+    // /reload: Pi fires session_shutdown(reload) on the OLD runner, rebuilds
+    // the registry (simulated by clearing pi.tools, as _buildRuntime would),
+    // then fires session_start(reload) on the NEW runner.
+    const shutdownHandler = pi.handlers.get("session_shutdown")!;
+    await shutdownHandler({ type: "session_shutdown", reason: "reload" }, createMockContext());
+    // Latch must be cleared so the next session_start re-registers.
+    expect(getRegisteredHindsightTools()).toEqual([]);
+
+    // Simulate the rebuilt (empty) registry.
+    (pi.tools as unknown[]).length = 0;
+
+    // Next session_start(reload) on the new runner must re-register tools.
+    const startHandler = pi.handlers.get("session_start")!;
+    await startHandler({ type: "session_start", reason: "reload" }, createMockContext());
+    expect(pi.tools.length).toBe(firstToolCount);
+    expect(getRegisteredHindsightTools().length).toBe(firstToolCount);
+    const activeHindsight = pi.getActiveTools().filter((n) => n.startsWith("hindsight_"));
+    expect(activeHindsight).toContain("hindsight_recall");
+  });
+
+  it.each([
+    "new",
+    "resume",
+    "fork",
+  ])("replacement runtime after session_shutdown(%s) registers fresh tools and does not inherit the old probe ctx", async (reason) => {
+    // Pi 0.74.1 /new, /resume, /fork tear down the previous
+    // AgentSession/ExtensionRunner and construct a fresh Extension object;
+    // the loader may reuse the cached factory closure for the same cwd. So a
+    // second `default()` call follows session_shutdown — it must NOT inherit
+    // the first runtime's toolsRegistered latch (or it would skip
+    // registerTools and leave the fresh registry empty), nor reuse the first
+    // runtime's in-flight probe/ctx. This exercises the production handlers
+    // across two distinct MockPi instances / two factory invocations.
+    const { getRegisteredHindsightTools } =
+      require("../src/runtime-state") as typeof import("../src/runtime-state");
+    let probeCalls = 0;
+    activeClientFactory = () => ({
+      healthCheck: mock(() => {
+        probeCalls++;
+        return Promise.resolve({ success: true });
+      }),
+      getServerVersion: mock(() => Promise.resolve({ success: true, version: "0.9.0" })),
+      retain: mock(() => Promise.resolve({ success: true })),
+      retainBatch: mock(() => Promise.resolve({ success: true })),
+      recall: mock(() => Promise.resolve({ success: true, response: { results: [] } })),
+      reflect: mock(() => Promise.resolve({ success: true, response: { text: "" } })),
+    });
+
+    const extension = await import("../src/index");
+
+    // Healthy first runtime: registers tools and completes a probe.
+    const pi1 = createMockPi();
+    extension.default(pi1);
+    await runHealthySessionStart(pi1);
+    expect(pi1.tools.map((t) => t.name)).toContain("hindsight_recall");
+    expect(getRegisteredHindsightTools().length).toBeGreaterThan(0);
+
+    // Pi tears down the old runner; session_shutdown returns immediately for
+    // new/resume/fork (nothing to flush — the switch/fork handlers already
+    // flushed).
+    const shutdownHandler = pi1.handlers.get("session_shutdown")!;
+    await shutdownHandler({ type: "session_shutdown", reason }, createMockContext());
+
+    // Fresh second extension instance.
+    const pi2 = createMockPi();
+    extension.default(pi2);
+    // The fresh instance must not claim the first runtime's registrations.
+    expect(getRegisteredHindsightTools()).toEqual([]);
+
+    await runHealthySessionStart(pi2);
+    const toolNames2 = pi2.tools.map((t) => t.name);
+    expect(toolNames2).toContain("hindsight_recall");
+    expect(toolNames2).toContain("hindsight_retain");
+    expect(pi2.getActiveTools().filter((n) => n.startsWith("hindsight_"))).toContain(
+      "hindsight_recall"
+    );
+    // The second instance performed its own fresh probe rather than reusing
+    // the first runtime's resolved probe/ctx.
+    expect(probeCalls).toBe(2);
   });
 
   it("startup auto-flush skips when a latched session_start refresh probe fails", async () => {
