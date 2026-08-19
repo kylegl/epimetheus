@@ -421,6 +421,18 @@ describe("recall", () => {
     sdk.recall = origRecall;
   });
 
+  it("uses the configured recall timeout when no override is supplied", async () => {
+    const client = new HindsightClientWrapper({ ...testConfig, recallTimeoutMs: 25 });
+    const { sdk, origRecall } = mockSdkMethods(client);
+    sdk.recall = mock(() => new Promise(() => {}));
+
+    const result = await client.recall({ query: "test" });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Operation timed out after 25ms");
+    sdk.recall = origRecall;
+  });
+
   it("returns error on abort", async () => {
     const client = new HindsightClientWrapper(testConfig);
     const { sdk, origRecall } = mockSdkMethods(client);

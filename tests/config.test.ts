@@ -36,6 +36,7 @@ const validConfig: HindsightConfig = {
   autoRecallPersist: false,
   autoRecallRole: "user",
   recallMaxQueryChars: 800,
+  recallTimeoutMs: 10000,
   autoRecallTypes: ["observation"] as ("world" | "experience" | "observation")[] | null,
   autoRecallTags: null,
   autoRecallTagsMatch: "any",
@@ -272,6 +273,17 @@ describe("validateConfig", () => {
     const config = { ...validConfig, hindsightContextMaxLength: 0 };
     const result = validateConfig(config);
     expect(result.valid).toBe(true);
+  });
+
+  it("resets an invalid recallTimeoutMs to the historical default", () => {
+    const config = { ...validConfig, recallTimeoutMs: 0 };
+    const result = validateConfig(config);
+
+    expect(result.valid).toBe(true);
+    expect(result.warnings).toContain(
+      "epimetheus: recallTimeoutMs must be an integer >= 1. Using default: 10000."
+    );
+    expect(config.recallTimeoutMs).toBe(10000);
   });
 
   it("warns when recallMaxQueryChars is less than 1", () => {
@@ -810,6 +822,26 @@ describe("loadConfig", () => {
     expect(config.apiKey).toBe("");
     expect(config.bankId).toBe("");
     expect(config.enabled).toBe(true);
+  });
+
+  it("recallTimeoutMs keeps the historical 10 second default", () => {
+    const { config } = loadConfig(TEST_DIR);
+    expect(config.recallTimeoutMs).toBe(10000);
+  });
+
+  it("recallTimeoutMs can be set via config file", () => {
+    writeFileSync(join(TEST_DIR, "config.json"), JSON.stringify({ recallTimeoutMs: 45000 }));
+
+    const { config } = loadConfig(TEST_DIR);
+    expect(config.recallTimeoutMs).toBe(45000);
+  });
+
+  it("recallTimeoutMs can be set via environment variable", () => {
+    process.env.EPIMETHEUS_RECALL_TIMEOUT_MS = "45000";
+
+    const { config, envVars } = loadConfig(TEST_DIR);
+    expect(config.recallTimeoutMs).toBe(45000);
+    expect(envVars).toContain("EPIMETHEUS_RECALL_TIMEOUT_MS");
   });
 
   it("autoRecallDisplay defaults to false", () => {
