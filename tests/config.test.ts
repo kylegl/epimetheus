@@ -9,6 +9,7 @@ import { join } from "node:path";
 import {
   type HindsightConfig,
   loadConfig,
+  MAX_RECALL_TIMEOUT_MS,
   type ObservationScopes,
   type ToolFilterMode,
   type ToolName,
@@ -275,13 +276,25 @@ describe("validateConfig", () => {
     expect(result.valid).toBe(true);
   });
 
-  it("resets an invalid recallTimeoutMs to the historical default", () => {
-    const config = { ...validConfig, recallTimeoutMs: 0 };
+  it("accepts recallTimeoutMs at the runtime timer maximum", () => {
+    const config = { ...validConfig, recallTimeoutMs: MAX_RECALL_TIMEOUT_MS };
+    const result = validateConfig(config);
+
+    expect(result.valid).toBe(true);
+    expect(result.warnings).toHaveLength(0);
+    expect(config.recallTimeoutMs).toBe(2_147_483_647);
+  });
+
+  it.each([
+    0,
+    MAX_RECALL_TIMEOUT_MS + 1,
+  ])("resets out-of-range recallTimeoutMs %d to the historical default", (recallTimeoutMs) => {
+    const config = { ...validConfig, recallTimeoutMs };
     const result = validateConfig(config);
 
     expect(result.valid).toBe(true);
     expect(result.warnings).toContain(
-      "epimetheus: recallTimeoutMs must be an integer >= 1. Using default: 10000."
+      "epimetheus: recallTimeoutMs must be an integer from 1 through 2147483647. Using default: 10000."
     );
     expect(config.recallTimeoutMs).toBe(10000);
   });

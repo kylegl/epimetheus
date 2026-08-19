@@ -52,7 +52,7 @@ Configuration is stored in `<getAgentDir()>/epimetheus/config.json` or `config.j
 | `hindsightContextMaxLength` | `100` | Maximum character length for the `context` field (including prefix) when the session name is auto-derived from the first user message. Manually set session names are preserved as-is and may exceed this length. |
 | `maxRecallTokens` | `null` | Maximum tokens for recalled content. When `null`, uses Hindsight's default (4096). See [max tokens context window size](https://hindsight.vectorize.io/developer/retrieval#max-tokens-context-window-size) for details. |
 | `recallMaxQueryChars` | `800` | Maximum characters from the user's message to use as the recall query |
-| `recallTimeoutMs` | `10000` | Deadline in milliseconds for each Hindsight recall request. Increase this for slower or larger banks. |
+| `recallTimeoutMs` | `10000` | Deadline in milliseconds for each Hindsight recall request. Must be an integer from 1 through 2147483647 (the runtime-safe signed 32-bit timer maximum). Increase this for slower or larger banks. |
 | `recallPromptPreamble` | *(see defaults)* | The system note text inside `<hindsight_memories>` fences that instructs the LLM how to use recalled memories |
 | `constantTags` | `["harness:pi"]` | Tags included on every retained document (useful for filtering in Hindsight) |
 | `autoFlushSessionOn` | `["switch", "fork", "reload"]` | Auto-flush the current session when these lifecycle events occur. Options: `"switch"` (`/new`, `/resume`), `"fork"` (`/fork`, `/clone`), `"reload"`, `"compact"`, `"quit"` (active-session only; skipped if `"quit"` is also in `autoFlushPendingOn`), `"tree"`. See [Auto-Flush Events](#auto-flush-events). |
@@ -609,7 +609,7 @@ Configuration options can also be set via environment variables (override config
 | `EPIMETHEUS_AUTO_RECALL_PERSIST` | `autoRecallPersist` | boolean | `false` |
 | `EPIMETHEUS_AUTO_RECALL_ROLE` | `autoRecallRole` | `"user"` \| `"assistant"` | `"user"` |
 | `EPIMETHEUS_RECALL_MAX_QUERY_CHARS` | `recallMaxQueryChars` | number | `800` |
-| `EPIMETHEUS_RECALL_TIMEOUT_MS` | `recallTimeoutMs` | positive integer | `10000` |
+| `EPIMETHEUS_RECALL_TIMEOUT_MS` | `recallTimeoutMs` | integer (1–2147483647) | `10000` |
 | `EPIMETHEUS_AUTO_RECALL_TYPES` | `autoRecallTypes` | string[] (JSON) | `["observation"]` |
 | `EPIMETHEUS_AUTO_RECALL_TAGS` | `autoRecallTags` | string[] (JSON) | `null` |
 | `EPIMETHEUS_AUTO_RECALL_TAGS_MATCH` | `autoRecallTagsMatch` | string | `"any"` |
