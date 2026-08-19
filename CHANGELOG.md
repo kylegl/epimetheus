@@ -4,6 +4,7 @@
 
 ### Features
 
+- **Configurable recall timeout** — Added `recallTimeoutMs` (default 10000 ms) so slower Hindsight searches can use a longer deadline without changing the historical default.
 - **Configured automatic extra context** — Added optional `extraContextGeneration` settings for an exact Pi `provider/model-id` and thinking level. Missing context is generated once from the retained message projection and persisted before the first session upsert; manual empty or non-empty context takes precedence.
 - **Bounded pending-session recovery** — Pending markers now include validated session-path hints, with targeted standard-filename and bounded legacy discovery as fallback instead of listing all Pi session history.
 - **Overall quit-flush deadline** — Added `quitFlushTimeoutMs` (default and maximum 10000 ms) as one deadline for all retention work during quit.
