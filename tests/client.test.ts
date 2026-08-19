@@ -6,6 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { HindsightError } from "@vectorize-io/hindsight-client";
 import { HindsightClientWrapper } from "../src/client";
+import { MAX_RECALL_TIMEOUT_MS, validateConfig } from "../src/config";
 import { testConfig } from "./fixtures";
 
 const originalFetch = globalThis.fetch;
@@ -431,6 +432,51 @@ describe("recall", () => {
     expect(result.success).toBe(false);
     expect(result.error).toContain("Operation timed out after 25ms");
     sdk.recall = origRecall;
+  });
+
+  it("schedules the maximum runtime-safe configured timeout", async () => {
+    const config = { ...testConfig, recallTimeoutMs: MAX_RECALL_TIMEOUT_MS };
+    expect(validateConfig(config).warnings).toHaveLength(0);
+    const client = new HindsightClientWrapper(config);
+    const { sdk, origRecall } = mockSdkMethods(client);
+    sdk.recall = mock(() => Promise.resolve({ results: [] }));
+    const originalSetTimeout = globalThis.setTimeout;
+    const scheduled: number[] = [];
+    globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number) => {
+      scheduled.push(delay ?? 0);
+      return originalSetTimeout(callback, delay);
+    }) as typeof setTimeout;
+
+    try {
+      expect((await client.recall({ query: "test" })).success).toBe(true);
+      expect(scheduled).toContain(MAX_RECALL_TIMEOUT_MS);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      sdk.recall = origRecall;
+    }
+  });
+
+  it("uses the historical timeout after configured timer overflow", async () => {
+    const config = { ...testConfig, recallTimeoutMs: MAX_RECALL_TIMEOUT_MS + 1 };
+    expect(validateConfig(config).warnings).toHaveLength(1);
+    const client = new HindsightClientWrapper(config);
+    const { sdk, origRecall } = mockSdkMethods(client);
+    sdk.recall = mock(() => Promise.resolve({ results: [] }));
+    const originalSetTimeout = globalThis.setTimeout;
+    const scheduled: number[] = [];
+    globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number) => {
+      scheduled.push(delay ?? 0);
+      return originalSetTimeout(callback, delay);
+    }) as typeof setTimeout;
+
+    try {
+      expect((await client.recall({ query: "test" })).success).toBe(true);
+      expect(scheduled).toContain(10000);
+      expect(scheduled).not.toContain(MAX_RECALL_TIMEOUT_MS + 1);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      sdk.recall = origRecall;
+    }
   });
 
   it("returns error on abort", async () => {

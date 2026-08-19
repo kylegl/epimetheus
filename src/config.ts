@@ -164,6 +164,9 @@ const VALID_AUTO_FLUSH_SESSION_EVENTS = [
 ] as const;
 const VALID_AUTO_FLUSH_PENDING_EVENTS = ["quit", "startup"] as const;
 
+/** Largest delay accepted by JavaScript runtimes without timer overflow. */
+export const MAX_RECALL_TIMEOUT_MS = 2_147_483_647;
+
 type AutoFlushSessionEvent = (typeof VALID_AUTO_FLUSH_SESSION_EVENTS)[number];
 type AutoFlushPendingEvent = (typeof VALID_AUTO_FLUSH_PENDING_EVENTS)[number];
 
@@ -1499,13 +1502,15 @@ export function validateConfig(config: HindsightConfig): {
   }
 
   // Validate recallTimeoutMs - reset to the historical default if invalid.
+  // JavaScript runtimes clamp larger setTimeout delays, commonly to 1ms.
   if (
     typeof config.recallTimeoutMs !== "number" ||
     !Number.isInteger(config.recallTimeoutMs) ||
-    config.recallTimeoutMs < 1
+    config.recallTimeoutMs < 1 ||
+    config.recallTimeoutMs > MAX_RECALL_TIMEOUT_MS
   ) {
     warnings.push(
-      `recallTimeoutMs must be an integer >= 1. Using default: ${DEFAULT_CONFIG.recallTimeoutMs}.`
+      `recallTimeoutMs must be an integer from 1 through ${MAX_RECALL_TIMEOUT_MS}. Using default: ${DEFAULT_CONFIG.recallTimeoutMs}.`
     );
     config.recallTimeoutMs = DEFAULT_CONFIG.recallTimeoutMs;
   }
